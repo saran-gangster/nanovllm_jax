@@ -9,6 +9,7 @@ Handles model execution including:
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from flax import nnx
 from functools import partial
@@ -211,18 +212,25 @@ class ModelRunner:
     def _prepare_block_tables(self, seqs: list[Sequence]) -> jnp.ndarray:
         """Prepare block tables tensor for attention.
         
+        Uses NumPy for efficient CPU-side padding.
+        
         Args:
             seqs: Sequences to prepare block tables for.
         
         Returns:
             Block tables array of shape [batch_size, max_blocks].
         """
+        batch_size = len(seqs)
         max_len = max(len(seq.block_table) for seq in seqs)
-        block_tables = [
-            seq.block_table + [-1] * (max_len - len(seq.block_table))
-            for seq in seqs
-        ]
-        return jnp.array(block_tables, dtype=jnp.int32)
+        
+        # Pre-allocate with -1 padding
+        block_tables = np.full((batch_size, max_len), -1, dtype=np.int32)
+        
+        for i, seq in enumerate(seqs):
+            bt_len = len(seq.block_table)
+            block_tables[i, :bt_len] = seq.block_table
+        
+        return jnp.asarray(block_tables)
     
     def _prepare_prefill(
         self,
@@ -231,6 +239,7 @@ class ModelRunner:
         """Prepare inputs for prefill phase.
         
         Packs multiple variable-length sequences into single tensors.
+        Uses NumPy for CPU-side operations to minimize overhead.
         
         Args:
             seqs: Sequences to prefill.
@@ -238,50 +247,65 @@ class ModelRunner:
         Returns:
             Tuple of (input_ids, positions, context).
         """
-        input_ids = []
-        positions = []
-        cu_seqlens_q = [0]
-        cu_seqlens_k = [0]
+        # Pre-compute sizes for efficient allocation
+        batch_size = len(seqs)
+        total_q_tokens = sum(len(seq) - seq.num_cached_tokens for seq in seqs)
+        total_slots = sum(
+            sum(self.block_size if i != seq.num_blocks - 1 else seq.last_block_num_tokens
+                for i in range(seq.num_cached_blocks, seq.num_blocks))
+            for seq in seqs if seq.block_table
+        )
+        
+        # Pre-allocate numpy arrays
+        input_ids = np.empty(total_q_tokens, dtype=np.int32)
+        positions = np.empty(total_q_tokens, dtype=np.int32)
+        slot_mapping = np.empty(total_slots, dtype=np.int32)
+        cu_seqlens_q = np.zeros(batch_size + 1, dtype=np.int32)
+        cu_seqlens_k = np.zeros(batch_size + 1, dtype=np.int32)
+        
         max_seqlen_q = 0
         max_seqlen_k = 0
-        slot_mapping = []
+        token_idx = 0
+        slot_idx = 0
         
-        for seq in seqs:
+        for i, seq in enumerate(seqs):
             seqlen = len(seq)
-            
-            # Input tokens (skip cached)
-            input_ids.extend(seq[seq.num_cached_tokens:])
-            positions.extend(list(range(seq.num_cached_tokens, seqlen)))
-            
-            # Sequence lengths
             seqlen_q = seqlen - seq.num_cached_tokens
             seqlen_k = seqlen
-            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
-            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
+            
+            # Update cumulative lengths
+            cu_seqlens_q[i + 1] = cu_seqlens_q[i] + seqlen_q
+            cu_seqlens_k[i + 1] = cu_seqlens_k[i] + seqlen_k
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             
-            # Slot mapping (for KV cache storage)
-            if seq.block_table:  # Skip if warmup
-                for i in range(seq.num_cached_blocks, seq.num_blocks):
-                    start = seq.block_table[i] * self.block_size
-                    if i != seq.num_blocks - 1:
-                        end = start + self.block_size
+            # Fill input tokens and positions using slices
+            input_ids[token_idx:token_idx + seqlen_q] = seq[seq.num_cached_tokens:]
+            positions[token_idx:token_idx + seqlen_q] = np.arange(seq.num_cached_tokens, seqlen)
+            token_idx += seqlen_q
+            
+            # Slot mapping using vectorized range computation
+            if seq.block_table:
+                for block_i in range(seq.num_cached_blocks, seq.num_blocks):
+                    start = seq.block_table[block_i] * self.block_size
+                    if block_i != seq.num_blocks - 1:
+                        block_len = self.block_size
                     else:
-                        end = start + seq.last_block_num_tokens
-                    slot_mapping.extend(list(range(start, end)))
+                        block_len = seq.last_block_num_tokens
+                    slot_mapping[slot_idx:slot_idx + block_len] = np.arange(start, start + block_len)
+                    slot_idx += block_len
         
         # Prepare block tables for prefix caching
         block_tables = None
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
             block_tables = self._prepare_block_tables(seqs)
         
-        # Convert to JAX arrays
-        input_ids = jnp.array(input_ids, dtype=jnp.int32)
-        positions = jnp.array(positions, dtype=jnp.int32)
-        cu_seqlens_q = jnp.array(cu_seqlens_q, dtype=jnp.int32)
-        cu_seqlens_k = jnp.array(cu_seqlens_k, dtype=jnp.int32)
-        slot_mapping = jnp.array(slot_mapping, dtype=jnp.int32)
+        # Convert to JAX arrays (single transfer to GPU)
+        input_ids = jnp.asarray(input_ids)
+        positions = jnp.asarray(positions)
+        cu_seqlens_q = jnp.asarray(cu_seqlens_q)
+        cu_seqlens_k = jnp.asarray(cu_seqlens_k)
+        slot_mapping = jnp.asarray(slot_mapping[:slot_idx])  # Trim to actual size
         
         context = create_prefill_context(
             cu_seqlens_q=cu_seqlens_q,
@@ -301,6 +325,7 @@ class ModelRunner:
         """Prepare inputs for decode phase.
         
         Each sequence contributes exactly one token (the last).
+        Uses NumPy for efficient CPU-side preparation.
         
         Args:
             seqs: Sequences to decode.
@@ -308,23 +333,25 @@ class ModelRunner:
         Returns:
             Tuple of (input_ids, positions, context).
         """
-        input_ids = []
-        positions = []
-        slot_mapping = []
-        context_lens = []
+        batch_size = len(seqs)
         
-        for seq in seqs:
-            input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
-            context_lens.append(len(seq))
-            slot_mapping.append(
-                seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
-            )
+        # Pre-allocate numpy arrays
+        input_ids = np.empty(batch_size, dtype=np.int32)
+        positions = np.empty(batch_size, dtype=np.int32)
+        slot_mapping = np.empty(batch_size, dtype=np.int32)
+        context_lens = np.empty(batch_size, dtype=np.int32)
         
-        input_ids = jnp.array(input_ids, dtype=jnp.int32)
-        positions = jnp.array(positions, dtype=jnp.int32)
-        slot_mapping = jnp.array(slot_mapping, dtype=jnp.int32)
-        context_lens = jnp.array(context_lens, dtype=jnp.int32)
+        for i, seq in enumerate(seqs):
+            input_ids[i] = seq.last_token
+            positions[i] = len(seq) - 1
+            context_lens[i] = len(seq)
+            slot_mapping[i] = seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
+        
+        # Convert to JAX arrays (single transfer)
+        input_ids = jnp.asarray(input_ids)
+        positions = jnp.asarray(positions)
+        slot_mapping = jnp.asarray(slot_mapping)
+        context_lens = jnp.asarray(context_lens)
         block_tables = self._prepare_block_tables(seqs)
         
         context = create_decode_context(

@@ -391,8 +391,8 @@ class Attention(nnx.Module):
             v=v,
             cu_seqlens_q=context.cu_seqlens_q,
             cu_seqlens_k=context.cu_seqlens_k,
-            bucketed_max_seqlen_q=context.bucketed_max_seqlen_q,  # Use bucketed sizes
-            bucketed_max_seqlen_k=context.bucketed_max_seqlen_k,  # Use bucketed sizes
+            bucketed_max_seqlen_q=context.max_seqlen_q,  # Already bucketed in context
+            bucketed_max_seqlen_k=context.max_seqlen_k,  # Already bucketed in context
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
             scale=self.scale,

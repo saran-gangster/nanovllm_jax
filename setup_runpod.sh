@@ -1,14 +1,17 @@
 #!/bin/bash
 # RunPod Setup Script for nanovllm_jax
-# Usage: ssh root@<IP> -p <PORT> -i ~/.ssh/id_ed25519 "bash -s" < setup_runpod.sh
+# Optimized for: runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404
+#
+# Usage: ssh root@<IP> -p <PORT> -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no "bash -s" < nanovllm_jax/setup_runpod.sh
 #
 # Or run remotely:
-# ssh root@<IP> -p <PORT> -i ~/.ssh/id_ed25519 "curl -s https://raw.githubusercontent.com/saran-gangster/nanovllm_jax/main/setup_runpod.sh | bash"
+# ssh root@<IP> -p <PORT> -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no "curl -s https://raw.githubusercontent.com/saran-gangster/nanovllm_jax/main/setup_runpod.sh | bash"
 
 set -e  # Exit on error
 
 echo "============================================"
 echo "  RunPod Setup for nanovllm_jax"
+echo "  (PyTorch 2.8.0 Template)"
 echo "============================================"
 
 # Colors for output
@@ -29,16 +32,9 @@ print_error() {
     echo -e "${RED}[✗]${NC} $1"
 }
 
-# Step 1: Install system dependencies
+# Step 1: Check GPU
 echo ""
-echo "Step 1: Installing system dependencies..."
-apt-get update -qq
-apt-get install -y -qq git python3-pip python3.12-venv > /dev/null 2>&1
-print_status "System dependencies installed"
-
-# Step 2: Check GPU
-echo ""
-echo "Step 2: Checking GPU..."
+echo "Step 1: Checking GPU..."
 if command -v nvidia-smi &> /dev/null; then
     GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
     GPU_MEM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader | head -1)
@@ -48,36 +44,19 @@ else
     exit 1
 fi
 
-# Step 3: Create virtual environment
+# Step 2: Install JAX with CUDA support and dependencies
 echo ""
-echo "Step 3: Setting up Python virtual environment..."
-cd /workspace
-
-if [ -d "venv" ]; then
-    print_warning "Virtual environment already exists, skipping creation"
-else
-    python3 -m venv venv
-    print_status "Virtual environment created at /workspace/venv"
-fi
-
-# Activate venv
-source venv/bin/activate
-print_status "Virtual environment activated"
-
-# Step 4: Install JAX with CUDA support and dependencies
-echo ""
-echo "Step 4: Installing JAX with CUDA 12 support and dependencies..."
-pip install --quiet --upgrade pip
-pip install --quiet jax[cuda12] flax transformers safetensors xxhash
+echo "Step 2: Installing JAX with CUDA 12 support and dependencies..."
+pip install --break-system-packages --quiet 'jax[cuda12]' flax transformers safetensors xxhash
 
 # Verify JAX installation
 JAX_VERSION=$(python3 -c "import jax; print(jax.__version__)")
-DEVICES=$(python3 -c "import jax; print(len(jax.devices()))")
+DEVICES=$(python3 -c "import jax; print(len(jax.devices()))" 2>/dev/null)
 print_status "JAX $JAX_VERSION installed with $DEVICES device(s)"
 
-# Step 5: Clone or update repository
+# Step 3: Clone or update repository
 echo ""
-echo "Step 5: Setting up nanovllm_jax repository..."
+echo "Step 3: Setting up nanovllm_jax repository..."
 cd /workspace
 
 if [ -d "nanovllm_jax" ]; then
@@ -91,9 +70,9 @@ else
 fi
 print_status "Repository ready at /workspace/nanovllm_jax"
 
-# Step 6: Download model (optional - Qwen3-0.6B)
+# Step 4: Download model (optional - Qwen3-0.6B)
 echo ""
-echo "Step 6: Downloading Qwen3-0.6B model..."
+echo "Step 4: Downloading Qwen3-0.6B model..."
 MODEL_PATH="/workspace/models/Qwen3-0.6B"
 
 if [ -d "$MODEL_PATH" ] && [ -f "$MODEL_PATH/model.safetensors" ]; then
@@ -102,15 +81,14 @@ else
     mkdir -p /workspace/models
     huggingface-cli download Qwen/Qwen3-0.6B --local-dir "$MODEL_PATH" 2>/dev/null || {
         print_warning "huggingface-cli download failed, trying alternative method..."
-        pip install --quiet huggingface_hub
         python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-0.6B', local_dir='$MODEL_PATH')"
     }
     print_status "Model downloaded to $MODEL_PATH"
 fi
 
-# Step 7: Quick test
+# Step 5: Quick test
 echo ""
-echo "Step 7: Running quick test..."
+echo "Step 5: Running quick test..."
 cd /workspace
 export PYTHONPATH=/workspace/nanovllm_jax:$PYTHONPATH
 
@@ -145,7 +123,6 @@ echo "============================================"
 echo ""
 echo "To use nanovllm_jax:"
 echo ""
-echo "  source /workspace/venv/bin/activate"
 echo "  cd /workspace"
 echo "  export PYTHONPATH=/workspace/nanovllm_jax:\$PYTHONPATH"
 echo ""
@@ -155,7 +132,4 @@ echo "  llm = LLM(model=\"/workspace/models/Qwen3-0.6B\")"
 echo "  outputs = llm.generate([\"Hello, my name is\"], SamplingParams(temperature=0.7, max_tokens=50))"
 echo "  print(outputs)"
 echo "  '"
-echo ""
-echo "Or run the example:"
-echo "  python3 /workspace/nanovllm_jax/example.py"
 echo ""

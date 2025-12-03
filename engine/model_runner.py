@@ -5,7 +5,16 @@ Handles model execution including:
 - Input preparation for prefill/decode
 - JIT compilation with batch size buckets
 - Multi-device coordination via Mesh + shard_map
+
+Optimizations:
+- Disables x64 mode to reduce memory bandwidth
+- Uses contiguous memory layouts for better cache locality
 """
+
+import os
+# Disable x64 mode BEFORE importing jax for reduced memory bandwidth
+# This must be set before JAX is imported
+os.environ.setdefault('JAX_ENABLE_X64', 'False')
 
 import jax
 import jax.numpy as jnp
@@ -14,6 +23,10 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from flax import nnx
 from functools import partial
 
+# Verify x64 is disabled
+if jax.config.jax_enable_x64:
+    print("Warning: x64 mode is enabled, performance may be reduced")
+
 from nanovllm_jax.config import Config
 from nanovllm_jax.engine.sequence import Sequence
 from nanovllm_jax.models.qwen3 import Qwen3ForCausalLM
@@ -21,7 +34,6 @@ from nanovllm_jax.layers.sampler import Sampler
 from nanovllm_jax.utils.context import AttentionContext, create_prefill_context, create_decode_context
 from nanovllm_jax.utils.loader import load_model
 from nanovllm_jax.utils.parallel import create_tp_mesh
-
 
 class ModelRunner:
     """Runs the model for inference with tensor parallelism support.

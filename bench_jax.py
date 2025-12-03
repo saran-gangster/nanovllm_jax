@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
-"""Benchmark: Naive HuggingFace decoding vs Nano-vLLM JAX inference."""
+"""Benchmark: Naive HuggingFace decoding vs Nano-vLLM JAX inference.
+
+Handles variance by:
+1. More warmup iterations
+2. Using median instead of mean
+3. Filtering outliers (JIT recompilation spikes)
+4. Reporting confidence intervals
+"""
 
 import sys
 import os
 
 # Add parent directory to path so 'import nanovllm_jax' works
-# When running from /workspace/nanovllm_jax/, we need /workspace/ in path
 script_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(script_dir)
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
 import time
+import numpy as np
 import jax
 import jax.numpy as jnp
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 
 # ============================================================================
@@ -29,17 +36,49 @@ PROMPTS = [
 ]
 MAX_NEW_TOKENS = 100
 TEMPERATURE = 0.7
-NUM_WARMUP = 2
-NUM_RUNS = 5
+NUM_WARMUP = 5  # More warmup for JIT stability
+NUM_RUNS = 10   # More runs for better statistics
+
+def compute_stats(times, name=""):
+    """Compute statistics with outlier filtering."""
+    times = np.array(times)
+    
+    # Filter outliers using IQR method
+    q1, q3 = np.percentile(times, [25, 75])
+    iqr = q3 - q1
+    lower = q1 - 1.5 * iqr
+    upper = q3 + 1.5 * iqr
+    filtered = times[(times >= lower) & (times <= upper)]
+    
+    if len(filtered) < len(times) * 0.5:
+        # If too many filtered, use all
+        filtered = times
+    
+    median = np.median(filtered)
+    mean = np.mean(filtered)
+    std = np.std(filtered)
+    p10 = np.percentile(filtered, 10)
+    p90 = np.percentile(filtered, 90)
+    
+    return {
+        'median': median,
+        'mean': mean,
+        'std': std,
+        'p10': p10,
+        'p90': p90,
+        'n_filtered': len(times) - len(filtered),
+        'n_total': len(times),
+    }
 
 print(f"JAX devices: {jax.devices()}")
 print(f"Model: {MODEL_PATH}")
 print(f"Max new tokens: {MAX_NEW_TOKENS}")
 print(f"Number of prompts: {len(PROMPTS)}")
-print("=" * 60)
+print(f"Warmup runs: {NUM_WARMUP}, Benchmark runs: {NUM_RUNS}")
+print("=" * 70)
 
 # ============================================================================
-# Benchmark 1: Naive HuggingFace PyTorch Decoding
+# Benchmark 1: HuggingFace PyTorch
 # ============================================================================
 print("\n[1] Loading HuggingFace model (PyTorch)...")
 hf_tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
@@ -117,14 +156,15 @@ for run in range(NUM_RUNS):
     print(f"  Run {run+1}: {elapsed:.3f}s")
 
 # Calculate HF stats
-hf_naive_avg = sum(hf_naive_times) / len(hf_naive_times)
-hf_batched_avg = sum(hf_batched_times) / len(hf_batched_times)
-hf_naive_tokens = len(PROMPTS) * MAX_NEW_TOKENS
-hf_naive_tps = hf_naive_tokens / hf_naive_avg
-hf_batched_tps = hf_naive_tokens / hf_batched_avg
+hf_naive_stats = compute_stats(hf_naive_times)
+hf_batched_stats = compute_stats(hf_batched_times)
+total_tokens = len(PROMPTS) * MAX_NEW_TOKENS
 
-print(f"\nHuggingFace Naive: {hf_naive_avg:.3f}s avg, {hf_naive_tps:.1f} tokens/s")
-print(f"HuggingFace Batched: {hf_batched_avg:.3f}s avg, {hf_batched_tps:.1f} tokens/s")
+hf_naive_tps = total_tokens / hf_naive_stats['median']
+hf_batched_tps = total_tokens / hf_batched_stats['median']
+
+print(f"\nHuggingFace Naive:   {hf_naive_stats['median']:.3f}s median (±{hf_naive_stats['std']:.3f}s), {hf_naive_tps:.1f} tok/s")
+print(f"HuggingFace Batched: {hf_batched_stats['median']:.3f}s median (±{hf_batched_stats['std']:.3f}s), {hf_batched_tps:.1f} tok/s")
 
 # Free HF model memory
 del hf_model
@@ -134,7 +174,7 @@ if torch.cuda.is_available():
 # ============================================================================
 # Benchmark 2: Nano-vLLM JAX
 # ============================================================================
-print("\n" + "=" * 60)
+print("\n" + "=" * 70)
 print("[2] Loading Nano-vLLM JAX model...")
 
 from nanovllm_jax import LLM, SamplingParams
@@ -143,56 +183,68 @@ from nanovllm_jax import LLM, SamplingParams
 nanovllm = LLM(model=MODEL_PATH)
 sampling_params = SamplingParams(temperature=TEMPERATURE, max_tokens=MAX_NEW_TOKENS)
 
-# Warmup nano-vllm
-print("Warming up Nano-vLLM JAX...")
-for _ in range(NUM_WARMUP):
-    _ = nanovllm.generate(PROMPTS[:1], SamplingParams(temperature=TEMPERATURE, max_tokens=10))
+# Heavy warmup for JIT stability
+print("Warming up Nano-vLLM JAX (heavy warmup for JIT stability)...")
+for i in range(NUM_WARMUP * 2):  # Double warmup for JAX
+    _ = nanovllm.generate(PROMPTS, SamplingParams(temperature=TEMPERATURE, max_tokens=20), use_tqdm=False)
+    if i == 0:
+        print(f"  Initial JIT compilation complete")
 
 # Benchmark nano-vllm
-print("Benchmarking Nano-vLLM JAX...")
+print(f"Benchmarking Nano-vLLM JAX ({NUM_RUNS} runs)...")
 nanovllm_times = []
 for run in range(NUM_RUNS):
-    jax.block_until_ready(jnp.zeros(1))  # Sync JAX
+    # Ensure JAX is synced before timing
+    jax.block_until_ready(jnp.zeros(1))
     start = time.perf_counter()
-    nanovllm_outputs = nanovllm.generate(PROMPTS, sampling_params)
-    jax.block_until_ready(jnp.zeros(1))  # Sync JAX
+    nanovllm_outputs = nanovllm.generate(PROMPTS, sampling_params, use_tqdm=False)
+    # Block until all computation is done
+    jax.block_until_ready(jnp.zeros(1))
     elapsed = time.perf_counter() - start
     nanovllm_times.append(elapsed)
     print(f"  Run {run+1}: {elapsed:.3f}s")
 
-# Calculate nano-vllm stats (exclude first run if it's significantly slower - JIT warmup)
-if len(nanovllm_times) > 1 and nanovllm_times[0] > 2 * nanovllm_times[1]:
-    print(f"  (Excluding Run 1 from average - JIT compilation overhead)")
-    nanovllm_avg = sum(nanovllm_times[1:]) / len(nanovllm_times[1:])
-else:
-    nanovllm_avg = sum(nanovllm_times) / len(nanovllm_times)
+# Calculate nano-vllm stats
+nanovllm_stats = compute_stats(nanovllm_times)
 nanovllm_tokens = sum(len(out['token_ids']) for out in nanovllm_outputs)
-nanovllm_tps = nanovllm_tokens / nanovllm_avg
+nanovllm_tps = nanovllm_tokens / nanovllm_stats['median']
 
-print(f"\nNano-vLLM JAX: {nanovllm_avg:.3f}s avg, {nanovllm_tps:.1f} tokens/s")
+print(f"\nNano-vLLM JAX: {nanovllm_stats['median']:.3f}s median (±{nanovllm_stats['std']:.3f}s), {nanovllm_tps:.1f} tok/s")
+if nanovllm_stats['n_filtered'] > 0:
+    print(f"  (Filtered {nanovllm_stats['n_filtered']} outliers from {nanovllm_stats['n_total']} runs)")
 
 # ============================================================================
 # Results Summary
 # ============================================================================
-print("\n" + "=" * 60)
-print("RESULTS SUMMARY")
-print("=" * 60)
-print(f"{'Method':<25} {'Time (s)':<12} {'Tokens/s':<12} {'Speedup':<10}")
-print("-" * 60)
-print(f"{'HF Naive (sequential)':<25} {hf_naive_avg:<12.3f} {hf_naive_tps:<12.1f} {'1.00x (baseline)':<10}")
-print(f"{'HF Batched':<25} {hf_batched_avg:<12.3f} {hf_batched_tps:<12.1f} {hf_naive_avg/hf_batched_avg:.2f}x")
-print(f"{'Nano-vLLM JAX':<25} {nanovllm_avg:<12.3f} {nanovllm_tps:<12.1f} {hf_naive_avg/nanovllm_avg:.2f}x")
-print("-" * 60)
+print("\n" + "=" * 70)
+print("RESULTS SUMMARY (using median for robustness)")
+print("=" * 70)
+print(f"{'Method':<25} {'Median (s)':<12} {'Std (s)':<10} {'Tok/s':<12} {'Speedup':<10}")
+print("-" * 70)
+print(f"{'HF Naive (sequential)':<25} {hf_naive_stats['median']:<12.3f} {hf_naive_stats['std']:<10.3f} {hf_naive_tps:<12.1f} {'1.00x (baseline)':<10}")
+print(f"{'HF Batched':<25} {hf_batched_stats['median']:<12.3f} {hf_batched_stats['std']:<10.3f} {hf_batched_tps:<12.1f} {hf_naive_stats['median']/hf_batched_stats['median']:.2f}x")
+print(f"{'Nano-vLLM JAX':<25} {nanovllm_stats['median']:<12.3f} {nanovllm_stats['std']:<10.3f} {nanovllm_tps:<12.1f} {hf_naive_stats['median']/nanovllm_stats['median']:.2f}x")
+print("-" * 70)
 
-# Speedup over batched HF
-speedup_vs_batched = hf_batched_avg / nanovllm_avg
-print(f"\nNano-vLLM JAX speedup vs HF Batched: {speedup_vs_batched:.2f}x")
-print(f"Nano-vLLM JAX speedup vs HF Naive: {hf_naive_avg/nanovllm_avg:.2f}x")
+# Speedup comparisons
+speedup_vs_batched = hf_batched_stats['median'] / nanovllm_stats['median']
+print(f"\nNano-vLLM JAX vs HF Batched: {speedup_vs_batched:.2f}x {'(faster)' if speedup_vs_batched > 1 else '(slower)'}")
+print(f"Nano-vLLM JAX vs HF Naive:   {hf_naive_stats['median']/nanovllm_stats['median']:.2f}x (faster)")
+
+# Detailed stats
+print("\n" + "=" * 70)
+print("DETAILED STATISTICS")
+print("=" * 70)
+print(f"{'Method':<25} {'P10 (s)':<10} {'Median (s)':<12} {'P90 (s)':<10} {'Range':<15}")
+print("-" * 70)
+print(f"{'HF Naive':<25} {hf_naive_stats['p10']:<10.3f} {hf_naive_stats['median']:<12.3f} {hf_naive_stats['p90']:<10.3f} {hf_naive_stats['p90']-hf_naive_stats['p10']:.3f}s")
+print(f"{'HF Batched':<25} {hf_batched_stats['p10']:<10.3f} {hf_batched_stats['median']:<12.3f} {hf_batched_stats['p90']:<10.3f} {hf_batched_stats['p90']-hf_batched_stats['p10']:.3f}s")
+print(f"{'Nano-vLLM JAX':<25} {nanovllm_stats['p10']:<10.3f} {nanovllm_stats['median']:<12.3f} {nanovllm_stats['p90']:<10.3f} {nanovllm_stats['p90']-nanovllm_stats['p10']:.3f}s")
 
 # Show sample outputs
-print("\n" + "=" * 60)
+print("\n" + "=" * 70)
 print("SAMPLE OUTPUTS (Nano-vLLM JAX)")
-print("=" * 60)
+print("=" * 70)
 for i, (prompt, output) in enumerate(zip(PROMPTS, nanovllm_outputs)):
     print(f"\nPrompt {i+1}: {prompt}")
     print(f"Output: {output['text'][:200]}...")

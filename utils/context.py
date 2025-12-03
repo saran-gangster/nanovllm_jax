@@ -5,11 +5,31 @@ explicitly through function calls for purity.
 
 The AttentionContext is registered as a JAX PyTree so it can be passed
 through JIT-compiled functions.
+
+Optimization: Static args (max_seqlen_q, max_seqlen_k) are bucketed to
+powers of 2 to reduce JIT recompilation when sequence lengths vary.
 """
 
 from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
+
+
+def _bucket_to_power_of_2(value: int, min_bucket: int = 16, max_bucket: int = 8192) -> int:
+    """Bucket a value to the next power of 2 for JIT stability.
+    
+    This reduces JIT recompilation by mapping many similar values to the same bucket.
+    E.g., 100 -> 128, 200 -> 256, 1000 -> 1024
+    """
+    if value <= min_bucket:
+        return min_bucket
+    if value >= max_bucket:
+        return max_bucket
+    # Find next power of 2
+    power = 1
+    while power < value:
+        power *= 2
+    return min(power, max_bucket)
 
 
 @dataclass
@@ -130,12 +150,16 @@ def create_prefill_context(
     # Compute last token indices for LM head
     last_token_indices = cu_seqlens_q[1:] - 1
     
+    # Bucket max_seqlen values to reduce JIT recompilation
+    bucketed_max_q = _bucket_to_power_of_2(max_seqlen_q)
+    bucketed_max_k = _bucket_to_power_of_2(max_seqlen_k)
+    
     return AttentionContext(
         is_prefill=True,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
+        max_seqlen_q=bucketed_max_q,
+        max_seqlen_k=bucketed_max_k,
         slot_mapping=slot_mapping,
         block_tables=block_tables,
         last_token_indices=last_token_indices,

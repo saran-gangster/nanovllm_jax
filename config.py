@@ -21,10 +21,10 @@ class Config:
         num_kvcache_blocks: Number of KV cache blocks (-1 = auto-calculate).
     """
     model: str
-    max_num_batched_tokens: int = 4096
-    max_num_seqs: int = 64
-    max_model_len: int = 2048
-    gpu_memory_utilization: float = 0.8
+    max_num_batched_tokens: int = 1024
+    max_num_seqs: int = 16
+    max_model_len: int = 512
+    gpu_memory_utilization: float = 0.5
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
     hf_config: AutoConfig | None = None

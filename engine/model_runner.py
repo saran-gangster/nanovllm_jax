@@ -146,13 +146,13 @@ class ModelRunner:
         if config.num_kvcache_blocks > 0:
             num_blocks = config.num_kvcache_blocks
         else:
-            # Estimate: assume we can store ~1GB of KV cache (conservative for Kaggle)
-            # Each block stores: 2 * block_size * num_kv_heads * head_dim * num_layers * 2 bytes (bf16)
+            # Estimate: use small KV cache for Kaggle compatibility
+            # Each block stores: 2 * block_size * num_kv_heads * head_dim * num_layers * 4 bytes (fp32)
             bytes_per_block = (
-                2 * self.block_size * num_kv_heads * head_dim * num_layers * 2
+                2 * self.block_size * num_kv_heads * head_dim * num_layers * 4
             )
-            target_memory = 1 * 1024 * 1024 * 1024  # 1GB (reduced from 4GB)
-            num_blocks = max(8, target_memory // bytes_per_block)  # At least 8 blocks
+            target_memory = 256 * 1024 * 1024  # 256MB - very conservative for Kaggle
+            num_blocks = max(4, target_memory // bytes_per_block)  # At least 4 blocks
         
         config.num_kvcache_blocks = num_blocks
         print(f"Allocating {num_blocks} KV cache blocks")

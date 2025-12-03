@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """Benchmark: Naive HuggingFace decoding vs Nano-vLLM JAX inference."""
 
+import sys
+import os
+
+# Add nanovllm_jax to path
+script_dir = os.path.dirname(os.path.abspath(__file__))
+if script_dir not in sys.path:
+    sys.path.insert(0, script_dir)
+
 import time
 import jax
 import jax.numpy as jnp

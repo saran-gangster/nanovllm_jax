@@ -183,12 +183,16 @@ from nanovllm_jax import LLM, SamplingParams
 nanovllm = LLM(model=MODEL_PATH)
 sampling_params = SamplingParams(temperature=TEMPERATURE, max_tokens=MAX_NEW_TOKENS)
 
-# Heavy warmup for JIT stability
+# Heavy warmup for JIT stability - use SAME parameters as benchmark
 print("Warming up Nano-vLLM JAX (heavy warmup for JIT stability)...")
-for i in range(NUM_WARMUP * 2):  # Double warmup for JAX
-    _ = nanovllm.generate(PROMPTS, SamplingParams(temperature=TEMPERATURE, max_tokens=20), use_tqdm=False)
-    if i == 0:
-        print(f"  Initial JIT compilation complete")
+# First warmup: compile all code paths
+_ = nanovllm.generate(PROMPTS, sampling_params, use_tqdm=False)
+print(f"  Initial JIT compilation complete")
+
+# Additional warmup runs to stabilize
+for i in range(NUM_WARMUP):
+    _ = nanovllm.generate(PROMPTS, sampling_params, use_tqdm=False)
+print(f"  {NUM_WARMUP + 1} warmup runs complete")
 
 # Benchmark nano-vllm
 print(f"Benchmarking Nano-vLLM JAX ({NUM_RUNS} runs)...")

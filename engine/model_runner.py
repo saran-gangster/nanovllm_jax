@@ -472,16 +472,7 @@ class ModelRunner:
         else:
             input_ids, positions, context = self._prepare_decode(seqs)
         
-        # OPTIMIZATION: Use fused model+sampler for decode (most critical path)
-        # This eliminates GPU→CPU→GPU sync between model and sampler
-        if not is_prefill and self._run_model_and_sample_jit is not None and self.tp_rank == 0:
-            temperatures = self._prepare_sample(seqs)
-            token_ids = self._run_model_and_sample_jit(
-                self.model, self.sampler, input_ids, positions, context, temperatures
-            )
-            return token_ids.tolist()
-        
-        # Fallback: separate model + sampler (for prefill or eager mode)
+        # Run model
         logits = self._run_model(input_ids, positions, context, is_prefill)
         
         # Sample tokens (only on rank 0)

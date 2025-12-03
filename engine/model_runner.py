@@ -158,7 +158,7 @@ class ModelRunner:
         print(f"Allocating {num_blocks} KV cache blocks")
         
         # Allocate KV cache: [2, num_layers, num_blocks, block_size, num_kv_heads, head_dim]
-        # Using bfloat16 for memory efficiency
+        # Using float16 for memory efficiency and broader GPU compatibility
         kv_cache_shape = (2, num_layers, num_blocks, self.block_size, num_kv_heads, head_dim)
         
         if self.mesh is not None:
@@ -169,11 +169,11 @@ class ModelRunner:
                 P(None, None, None, None, "tp", None)  # Shard on kv_heads dimension
             )
             self.kv_cache = jax.device_put(
-                jnp.zeros(kv_cache_shape, dtype=jnp.bfloat16),
+                jnp.zeros(kv_cache_shape, dtype=jnp.float16),
                 kv_sharding
             )
         else:
-            self.kv_cache = jnp.zeros(kv_cache_shape, dtype=jnp.bfloat16)
+            self.kv_cache = jnp.zeros(kv_cache_shape, dtype=jnp.float16)
         
         # Wire KV cache to attention layers
         self._wire_kv_cache()

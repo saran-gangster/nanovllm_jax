@@ -7,15 +7,16 @@ The implementation precomputes cos/sin caches for efficiency.
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from functools import lru_cache
+from functools import lru_cache, partial
 
 
+@jax.jit
 def apply_rotary_emb(
     x: jax.Array,
     cos: jax.Array,
     sin: jax.Array,
 ) -> jax.Array:
-    """Apply rotary embeddings to input tensor.
+    """Apply rotary embeddings to input tensor (JIT compiled).
     
     Args:
         x: Input tensor of shape [..., head_dim].
@@ -25,14 +26,16 @@ def apply_rotary_emb(
     Returns:
         Tensor with rotary embeddings applied.
     """
-    # Split into two halves
-    x1, x2 = jnp.split(x.astype(jnp.float32), 2, axis=-1)
+    # Split into two halves - compute in float32 for precision
+    orig_dtype = x.dtype
+    x = x.astype(jnp.float32)
+    x1, x2 = jnp.split(x, 2, axis=-1)
     
     # Apply rotation
     y1 = x1 * cos - x2 * sin
     y2 = x2 * cos + x1 * sin
     
-    return jnp.concatenate([y1, y2], axis=-1).astype(x.dtype)
+    return jnp.concatenate([y1, y2], axis=-1).astype(orig_dtype)
 
 
 class RotaryEmbedding(nnx.Module):

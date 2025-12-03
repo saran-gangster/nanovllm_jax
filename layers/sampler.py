@@ -7,6 +7,7 @@ for efficient parallel sampling.
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from functools import partial
 
 
 class Sampler(nnx.Module):
@@ -19,6 +20,7 @@ class Sampler(nnx.Module):
     def __init__(self, *, rngs: nnx.Rngs):
         self.rngs = rngs
     
+    @partial(nnx.jit, static_argnums=())
     def __call__(
         self,
         logits: jax.Array,
@@ -33,8 +35,8 @@ class Sampler(nnx.Module):
         Returns:
             Sampled token IDs of shape [batch_size].
         """
-        # Scale logits by temperature
-        logits = logits.astype(jnp.float32) / temperatures[:, None]
+        # Scale logits by temperature (use float32 for numerical stability)
+        logits = logits.astype(jnp.float32) / temperatures[:, None].astype(jnp.float32)
         
         # Gumbel-max trick for sampling
         # sample = argmax(logits + gumbel_noise)

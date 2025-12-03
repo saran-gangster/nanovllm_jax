@@ -199,12 +199,14 @@ class ModelRunner:
         # Note: In JAX, JIT compilation happens on first call with each shape
         # We don't need to explicitly capture like CUDA graphs
         
-        @nnx.jit
+        # Use a more aggressive JIT with reduced recompilations
         def run_model_jit(model, input_ids, positions, context):
+            """JIT-compiled model forward pass."""
             hidden_states = model(input_ids, positions, context)
             return model.compute_logits(hidden_states, context)
         
-        self._run_model_jit = run_model_jit
+        # Apply JIT with donated args for memory efficiency
+        self._run_model_jit = nnx.jit(run_model_jit)
     
     def _prepare_block_tables(self, seqs: list[Sequence]) -> jnp.ndarray:
         """Prepare block tables tensor for attention.

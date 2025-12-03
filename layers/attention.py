@@ -52,6 +52,11 @@ def store_kv_to_cache(
     Returns:
         Updated (k_cache, v_cache) tuple.
     """
+    # Ensure key/value have same dtype as cache to avoid scatter warnings
+    target_dtype = k_cache.dtype
+    key = key.astype(target_dtype)
+    value = value.astype(target_dtype)
+
     # Create mask for valid slots (not -1)
     valid_mask = slot_mapping >= 0
     
@@ -194,6 +199,11 @@ def variable_length_attention_prefill(
     batch_size = cu_seqlens_q.shape[0] - 1
     head_dim = q.shape[-1]
     total_tokens = q.shape[0]
+    # Ensure consistent dtype across arrays to avoid mismatches with dot_product_attention
+    target_dtype = k.dtype if hasattr(k, 'dtype') else jnp.bfloat16
+    q = q.astype(target_dtype)
+    k = k.astype(target_dtype)
+    v = v.astype(target_dtype)
     
     # Process each sequence using lax.fori_loop for memory efficiency
     # This avoids creating large padded batched tensors
@@ -243,7 +253,8 @@ def variable_length_attention_prefill(
         full_mask = causal_mask & padding_mask
         
         # Apply mask with large negative value for softmax
-        scores = jnp.where(full_mask[None, :, :], scores, -1e9)
+        neg_inf = jnp.array(-1e9, dtype=target_dtype)
+        scores = jnp.where(full_mask[None, :, :], scores, neg_inf)
         
         # Softmax and weighted sum
         attn_weights = jax.nn.softmax(scores, axis=-1)
@@ -254,7 +265,7 @@ def variable_length_attention_prefill(
         
         # Mask output for valid positions only
         valid_mask = jnp.arange(max_seqlen_q) < len_q
-        seq_output = jnp.where(valid_mask[:, None, None], seq_output, 0.0)
+        seq_output = jnp.where(valid_mask[:, None, None], seq_output, jnp.array(0.0, dtype=target_dtype))
         
         # Scatter to output using segment-based approach
         positions = start_q + jnp.arange(max_seqlen_q)
@@ -262,7 +273,7 @@ def variable_length_attention_prefill(
         
         return output
     
-    output = jnp.zeros((total_tokens, num_heads, head_dim), dtype=q.dtype)
+    output = jnp.zeros((total_tokens, num_heads, head_dim), dtype=target_dtype)
     output = lax.fori_loop(0, batch_size, process_single_seq, output)
     
     return output
@@ -370,6 +381,11 @@ class Attention(nnx.Module):
         )
         
         # q: [batch, heads, dim] -> [batch, 1, heads, dim] for dot_product_attention
+        # Cast q/k/v to the cache dtype (bfloat16) for consistent ops
+        target_dtype = self.k_cache.value.dtype if (self.k_cache is not None and self.k_cache.value is not None) else q.dtype
+        q = q.astype(target_dtype)
+        k_gathered = k_gathered.astype(target_dtype)
+        v_gathered = v_gathered.astype(target_dtype)
         q = q[:, None, :, :]
         
         # Handle GQA: repeat KV heads to match query heads

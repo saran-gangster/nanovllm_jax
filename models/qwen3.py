@@ -75,6 +75,8 @@ class Qwen3Attention(nnx.Module):
         self.qkv_bias = qkv_bias
         self.hidden_size = hidden_size
         self.mesh = mesh
+        # For now, default to bfloat16 for model computations to match KV cache
+        self.model_dtype = jnp.bfloat16
         
         # QKV projection (fused)
         self.qkv_proj = QKVParallelLinear(
@@ -159,6 +161,10 @@ class Qwen3Attention(nnx.Module):
         
         # Apply rotary embeddings
         q, k = self.rotary_emb(positions, q, k)
+        # Cast to model dtype for consistent compute with KV cache
+        q = q.astype(self.model_dtype)
+        k = k.astype(self.model_dtype)
+        v = v.astype(self.model_dtype)
         
         # Attention
         o = self.attn(q, k, v, context)

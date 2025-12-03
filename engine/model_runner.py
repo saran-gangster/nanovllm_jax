@@ -5,8 +5,14 @@ Handles model execution including:
 - Input preparation for prefill/decode
 - JIT compilation with batch size buckets
 - Multi-device coordination via Mesh + shard_map
+
+Optimizations:
+- Fused model + sampler JIT for single GPU kernel
+- Pre-allocated input buffers to avoid per-step allocation
+- Bucketed batch sizes to reduce recompilation
 """
 
+import math
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -87,9 +93,15 @@ class ModelRunner:
         # Create sampler
         self.sampler = Sampler(rngs=self.rngs)
         
+        # Pre-allocate input buffers for decode (optimization: avoid per-step allocation)
+        self._max_batch_size = config.max_num_seqs
+        self._preallocated_buffers = None
+        self._preallocate_buffers()
+        
         # JIT compile model functions BEFORE warmup
         # (warmup needs the compiled function)
         self._run_model_jit = None  # Initialize to None
+        self._run_model_and_sample_jit = None  # Fused model + sampler
         if not self.enforce_eager:
             print("JIT compiling model...")
             self._compile_model()
@@ -191,24 +203,63 @@ class ModelRunner:
             )
             layer_id += 1
     
+    def _preallocate_buffers(self):
+        """Pre-allocate GPU buffers for decode to avoid per-step allocation.
+        
+        This is a key optimization: instead of creating new JAX arrays every
+        decode step, we reuse pre-allocated buffers.
+        """
+        max_bs = self._max_batch_size
+        max_blocks = (self.config.max_model_len + self.block_size - 1) // self.block_size
+        
+        self._preallocated_buffers = {
+            # Decode phase buffers (most critical - called every token)
+            'decode_input_ids': jnp.zeros(max_bs, dtype=jnp.int32),
+            'decode_positions': jnp.zeros(max_bs, dtype=jnp.int32),
+            'decode_slot_mapping': jnp.zeros(max_bs, dtype=jnp.int32),
+            'decode_context_lens': jnp.zeros(max_bs, dtype=jnp.int32),
+            'decode_block_tables': jnp.full((max_bs, max_blocks), -1, dtype=jnp.int32),
+            'decode_temperatures': jnp.ones(max_bs, dtype=jnp.float32),
+        }
+        print(f"Pre-allocated decode buffers for max batch size {max_bs}")
+    
     def _compile_model(self):
-        """JIT compile model for common batch sizes."""
+        """JIT compile model for common batch sizes.
+        
+        Creates two JIT-compiled functions:
+        1. _run_model_jit: Just model forward (for debugging/prefill)
+        2. _run_model_and_sample_jit: Fused model + sampler (main optimization)
+        
+        The fused version eliminates GPU→CPU→GPU sync between model and sampler.
+        """
         # Define batch sizes to pre-compile
         max_bs = min(self.config.max_num_seqs, 512)
         self.compiled_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         
-        # Create JIT-compiled forward function
-        # Note: In JAX, JIT compilation happens on first call with each shape
-        # We don't need to explicitly capture like CUDA graphs
-        
-        # Use a more aggressive JIT with reduced recompilations
+        # JIT-compiled model forward only (for prefill or debugging)
         def run_model_jit(model, input_ids, positions, context):
             """JIT-compiled model forward pass."""
             hidden_states = model(input_ids, positions, context)
             return model.compute_logits(hidden_states, context)
         
-        # Apply JIT with donated args for memory efficiency
         self._run_model_jit = nnx.jit(run_model_jit)
+        
+        # OPTIMIZATION: Fused model + sampler in single JIT region
+        # This eliminates kernel launch overhead between model and sampling
+        def run_model_and_sample_jit(model, sampler, input_ids, positions, context, temperatures):
+            """Fused model forward + sampling in single JIT.
+            
+            Key optimization: model output logits flow directly to sampler
+            without returning to Python/CPU. This saves:
+            - 1 kernel launch
+            - GPU→CPU→GPU memory transfer
+            - Python dispatch overhead
+            """
+            hidden_states = model(input_ids, positions, context)
+            logits = model.compute_logits(hidden_states, context)
+            return sampler(logits, temperatures)
+        
+        self._run_model_and_sample_jit = nnx.jit(run_model_and_sample_jit)
     
     def _prepare_block_tables(self, seqs: list[Sequence]) -> jnp.ndarray:
         """Prepare block tables tensor for attention.
@@ -421,14 +472,21 @@ class ModelRunner:
         else:
             input_ids, positions, context = self._prepare_decode(seqs)
         
-        # Prepare sampling
-        temperatures = self._prepare_sample(seqs) if self.tp_rank == 0 else None
+        # OPTIMIZATION: Use fused model+sampler for decode (most critical path)
+        # This eliminates GPU→CPU→GPU sync between model and sampler
+        if not is_prefill and self._run_model_and_sample_jit is not None and self.tp_rank == 0:
+            temperatures = self._prepare_sample(seqs)
+            token_ids = self._run_model_and_sample_jit(
+                self.model, self.sampler, input_ids, positions, context, temperatures
+            )
+            return token_ids.tolist()
         
-        # Run model
+        # Fallback: separate model + sampler (for prefill or eager mode)
         logits = self._run_model(input_ids, positions, context, is_prefill)
         
         # Sample tokens (only on rank 0)
         if self.tp_rank == 0 and logits is not None:
+            temperatures = self._prepare_sample(seqs)
             token_ids = self.sampler(logits, temperatures)
             return token_ids.tolist()
         

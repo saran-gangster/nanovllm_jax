@@ -351,8 +351,8 @@ class Qwen3Model(nnx.Module):
             rngs=rngs,
         )
         
-        # Decoder layers
-        self.layers = [
+        # Decoder layers - use nnx.List for Flax NNX 0.12+ compatibility
+        self.layers = nnx.List([
             Qwen3DecoderLayer(
                 config,
                 tp_size=tp_size,
@@ -362,7 +362,7 @@ class Qwen3Model(nnx.Module):
                 rngs=rngs,
             )
             for _ in range(config.num_hidden_layers)
-        ]
+        ])
         
         # Final norm
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

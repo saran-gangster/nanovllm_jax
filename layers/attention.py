@@ -95,14 +95,27 @@ def gather_kv_from_cache(
     # Clamp block indices to valid range for gathering
     safe_block_tables = jnp.clip(block_tables, 0, k_cache.shape[0] - 1)
     
-    # Gather blocks for each sequence - use take for better performance
-    flat_indices = safe_block_tables.reshape(-1)
-    gathered_k = jnp.take(k_cache, flat_indices, axis=0)
-    gathered_v = jnp.take(v_cache, flat_indices, axis=0)
+    # Flatten k_cache and v_cache: [num_blocks, block_size, heads, dim] -> [num_blocks * block_size, heads, dim]
+    k_flat = k_cache.reshape(-1, num_kv_heads, head_dim)
+    v_flat = v_cache.reshape(-1, num_kv_heads, head_dim)
     
-    # Reshape to [batch, max_context_len, heads, dim]
-    gathered_k = gathered_k.reshape(batch_size, max_context_len, num_kv_heads, head_dim)
-    gathered_v = gathered_v.reshape(batch_size, max_context_len, num_kv_heads, head_dim)
+    # Create token indices from block tables
+    # For each (batch, block_idx), compute base = block_tables[b, i] * block_size
+    # Then for each position in block, add offset
+    block_offsets = jnp.arange(block_size)  # [block_size]
+    
+    # Compute flat indices: [batch, max_blocks, block_size]
+    base_indices = safe_block_tables[:, :, None] * block_size  # [batch, max_blocks, 1]
+    token_indices = base_indices + block_offsets[None, None, :]  # [batch, max_blocks, block_size]
+    token_indices = token_indices.reshape(batch_size, max_context_len)  # [batch, max_context_len]
+    
+    # Clip to valid cache range
+    max_cache_idx = k_flat.shape[0] - 1
+    token_indices = jnp.clip(token_indices, 0, max_cache_idx)
+    
+    # Gather using advanced indexing - [batch, max_context_len, heads, dim]
+    gathered_k = k_flat[token_indices]
+    gathered_v = v_flat[token_indices]
     
     # Create attention mask based on context_lens
     positions = jnp.arange(max_context_len)[None, :]
@@ -443,11 +456,6 @@ class Attention(nnx.Module):
             self.v_cache = v_cache_flat.reshape(
                 num_blocks, self.block_size, self.num_kv_heads, self.head_dim
             )
-        
-        if context.is_prefill:
-            return self._prefill_attention(q, k, v, context)
-        else:
-            return self._decode_attention(q, context)
         
         if context.is_prefill:
             return self._prefill_attention(q, k, v, context)

@@ -4,10 +4,12 @@
 import sys
 import os
 
-# Add nanovllm_jax to path
+# Add parent directory to path so 'import nanovllm_jax' works
+# When running from /workspace/nanovllm_jax/, we need /workspace/ in path
 script_dir = os.path.dirname(os.path.abspath(__file__))
-if script_dir not in sys.path:
-    sys.path.insert(0, script_dir)
+parent_dir = os.path.dirname(script_dir)
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
 
 import time
 import jax

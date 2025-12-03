@@ -159,14 +159,10 @@ class Qwen3Attention(nnx.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
         
-        # Apply rotary embeddings
+        # Apply rotary embeddings (preserves dtype)
         q, k = self.rotary_emb(positions, q, k)
-        # Cast to model dtype for consistent compute with KV cache
-        q = q.astype(self.model_dtype)
-        k = k.astype(self.model_dtype)
-        v = v.astype(self.model_dtype)
         
-        # Attention
+        # Attention (all tensors already in model dtype from QKV projection)
         o = self.attn(q, k, v, context)
         
         # Reshape and project output

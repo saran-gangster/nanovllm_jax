@@ -95,27 +95,14 @@ def gather_kv_from_cache(
     # Clamp block indices to valid range for gathering
     safe_block_tables = jnp.clip(block_tables, 0, k_cache.shape[0] - 1)
     
-    # Flatten k_cache and v_cache: [num_blocks, block_size, heads, dim] -> [num_blocks * block_size, heads, dim]
-    k_flat = k_cache.reshape(-1, num_kv_heads, head_dim)
-    v_flat = v_cache.reshape(-1, num_kv_heads, head_dim)
+    # Use direct block indexing - more memory efficient
+    # Gather blocks: [batch, max_blocks] -> [batch, max_blocks, block_size, heads, dim]
+    gathered_k_blocks = k_cache[safe_block_tables]  # [batch, max_blocks, block_size, heads, dim]
+    gathered_v_blocks = v_cache[safe_block_tables]
     
-    # Create token indices from block tables
-    # For each (batch, block_idx), compute base = block_tables[b, i] * block_size
-    # Then for each position in block, add offset
-    block_offsets = jnp.arange(block_size)  # [block_size]
-    
-    # Compute flat indices: [batch, max_blocks, block_size]
-    base_indices = safe_block_tables[:, :, None] * block_size  # [batch, max_blocks, 1]
-    token_indices = base_indices + block_offsets[None, None, :]  # [batch, max_blocks, block_size]
-    token_indices = token_indices.reshape(batch_size, max_context_len)  # [batch, max_context_len]
-    
-    # Clip to valid cache range
-    max_cache_idx = k_flat.shape[0] - 1
-    token_indices = jnp.clip(token_indices, 0, max_cache_idx)
-    
-    # Gather using advanced indexing - [batch, max_context_len, heads, dim]
-    gathered_k = k_flat[token_indices]
-    gathered_v = v_flat[token_indices]
+    # Reshape to [batch, max_context_len, heads, dim]
+    gathered_k = gathered_k_blocks.reshape(batch_size, max_context_len, num_kv_heads, head_dim)
+    gathered_v = gathered_v_blocks.reshape(batch_size, max_context_len, num_kv_heads, head_dim)
     
     # Create attention mask based on context_lens
     positions = jnp.arange(max_context_len)[None, :]

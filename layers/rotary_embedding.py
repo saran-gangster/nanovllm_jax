@@ -26,16 +26,15 @@ def apply_rotary_emb(
     Returns:
         Tensor with rotary embeddings applied.
     """
-    # Split into two halves - compute in float32 for precision
-    orig_dtype = x.dtype
-    x = x.astype(jnp.float32)
+    # Split into two halves
+    # Keep in original dtype (bfloat16) - XLA handles precision internally
     x1, x2 = jnp.split(x, 2, axis=-1)
     
-    # Apply rotation
+    # Apply rotation (cos/sin are float32, but XLA will optimize the mixed precision)
     y1 = x1 * cos - x2 * sin
     y2 = x2 * cos + x1 * sin
     
-    return jnp.concatenate([y1, y2], axis=-1).astype(orig_dtype)
+    return jnp.concatenate([y1, y2], axis=-1)
 
 
 class RotaryEmbedding(nnx.Module):

@@ -27,22 +27,28 @@ from nanovllm_jax.layers.embed_head import VocabParallelEmbedding, ParallelLMHea
 
 
 def tensor_to_jax(tensor) -> jax.Array:
-    """Convert safetensors tensor to JAX array.
+    """Convert safetensors tensor to JAX array in bfloat16 for efficiency.
     
     Args:
         tensor: Tensor from safetensors (numpy-compatible).
     
     Returns:
-        JAX array with same data.
+        JAX array with same data, cast to bfloat16 for efficient inference.
     """
     # safetensors returns numpy arrays when using framework="np"
     # or torch tensors when using framework="pt"
     if hasattr(tensor, 'numpy'):
         # It's a torch tensor
-        return jnp.array(tensor.numpy())
+        arr = jnp.array(tensor.numpy())
     else:
         # It's already numpy
-        return jnp.array(tensor)
+        arr = jnp.array(tensor)
+    
+    # Cast to bfloat16 for efficient GPU inference (2x memory bandwidth)
+    # Only cast floating point tensors
+    if jnp.issubdtype(arr.dtype, jnp.floating):
+        return arr.astype(jnp.bfloat16)
+    return arr
 
 
 def get_nested_attr(obj, path: str):

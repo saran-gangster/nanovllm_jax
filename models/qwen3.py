@@ -75,8 +75,8 @@ class Qwen3Attention(nnx.Module):
         self.qkv_bias = qkv_bias
         self.hidden_size = hidden_size
         self.mesh = mesh
-        # Use float32 for model computations - universal GPU compatibility
-        self.model_dtype = jnp.float32
+        # Use bfloat16 for model computations - faster on modern GPUs (A100, A6000, etc.)
+        self.model_dtype = jnp.bfloat16
         
         # QKV projection (fused)
         self.qkv_proj = QKVParallelLinear(

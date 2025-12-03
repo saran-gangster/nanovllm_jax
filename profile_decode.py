@@ -215,20 +215,9 @@ def main():
     
     gather_time = profile_component("KV gather", gather_kv)
     
-    # Profile store
-    num_kv_heads = k_cache.shape[2]
-    head_dim = k_cache.shape[3]
-    dummy_k = jnp.ones((batch_size, num_kv_heads, head_dim), dtype=jnp.bfloat16)
-    dummy_v = jnp.ones((batch_size, num_kv_heads, head_dim), dtype=jnp.bfloat16)
-    
-    num_blocks = k_cache.shape[0]
-    k_flat = k_cache.reshape(-1, num_kv_heads, head_dim)
-    v_flat = v_cache.reshape(-1, num_kv_heads, head_dim)
-    
-    def store_kv():
-        return store_kv_to_cache(dummy_k, dummy_v, k_flat, v_flat, context.slot_mapping)
-    
-    store_time = profile_component("KV store", store_kv)
+    # Skip store profiling - causes buffer donation issues
+    store_time = 0.0
+    print("  KV store: (skipped - buffer donation)")
     
     # Profile dot product attention
     print("\n[I] Dot product attention:")
@@ -237,14 +226,15 @@ def main():
     )
     
     # Prepare Q
-    q_dummy = jnp.ones((batch_size, 1, hf_config.num_attention_heads // 1, head_dim), dtype=jnp.bfloat16)
+    head_dim_attn = k_cache.shape[3]
+    q_dummy = jnp.ones((batch_size, 1, hf_config.num_attention_heads // 1, head_dim_attn), dtype=jnp.bfloat16)
     mask_expanded = mask[:, None, None, :]
     
     def dot_product_attn():
         return jax.nn.dot_product_attention(
             q_dummy, k_gathered, v_gathered,
             mask=mask_expanded,
-            scale=head_dim ** -0.5
+            scale=head_dim_attn ** -0.5
         )
     
     dpa_time = profile_component("dot_product_attention", dot_product_attn)

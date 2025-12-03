@@ -292,6 +292,10 @@ class Attention(nnx.Module):
         block_size: Number of tokens per cache block.
     """
     
+    # Declare cache attributes as data (mutable) for Flax NNX 0.12+
+    k_cache: jax.Array | None = nnx.data()
+    v_cache: jax.Array | None = nnx.data()
+    
     def __init__(
         self,
         num_heads: int,
@@ -308,13 +312,13 @@ class Attention(nnx.Module):
         
         # KV cache will be set by model runner after allocation
         # Shape: [num_blocks, block_size, num_kv_heads, head_dim]
-        self.k_cache: nnx.Variable | None = None
-        self.v_cache: nnx.Variable | None = None
+        self.k_cache = None
+        self.v_cache = None
     
     def set_kv_cache(self, k_cache: jax.Array, v_cache: jax.Array):
         """Set KV cache references (called by model runner)."""
-        self.k_cache = nnx.Variable(k_cache)
-        self.v_cache = nnx.Variable(v_cache)
+        self.k_cache = k_cache
+        self.v_cache = v_cache
     
     def _prefill_attention(
         self,
@@ -369,8 +373,8 @@ class Attention(nnx.Module):
         # k_gathered, v_gathered: [batch, max_context_len, kv_heads, dim]
         # kv_mask: [batch, max_context_len]
         k_gathered, v_gathered, kv_mask = gather_kv_from_cache(
-            self.k_cache.value,
-            self.v_cache.value,
+            self.k_cache,
+            self.v_cache,
             context.block_tables,
             context.context_lens,
             self.block_size,
@@ -378,7 +382,7 @@ class Attention(nnx.Module):
         
         # q: [batch, heads, dim] -> [batch, 1, heads, dim] for dot_product_attention
         # Cast q/k/v to the cache dtype (bfloat16) for consistent ops
-        target_dtype = self.k_cache.value.dtype if (self.k_cache is not None and self.k_cache.value is not None) else q.dtype
+        target_dtype = self.k_cache.dtype if self.k_cache is not None else q.dtype
         q = q.astype(target_dtype)
         k_gathered = k_gathered.astype(target_dtype)
         v_gathered = v_gathered.astype(target_dtype)
@@ -425,19 +429,19 @@ class Attention(nnx.Module):
         # Store K/V to cache
         if self.k_cache is not None and self.v_cache is not None:
             # Flatten cache for slot-based indexing
-            k_cache_flat = self.k_cache.value.reshape(-1, self.num_kv_heads, self.head_dim)
-            v_cache_flat = self.v_cache.value.reshape(-1, self.num_kv_heads, self.head_dim)
+            k_cache_flat = self.k_cache.reshape(-1, self.num_kv_heads, self.head_dim)
+            v_cache_flat = self.v_cache.reshape(-1, self.num_kv_heads, self.head_dim)
             
             k_cache_flat, v_cache_flat = store_kv_to_cache(
                 k, v, k_cache_flat, v_cache_flat, context.slot_mapping
             )
             
             # Reshape back and update
-            num_blocks = self.k_cache.value.shape[0]
-            self.k_cache.value = k_cache_flat.reshape(
+            num_blocks = self.k_cache.shape[0]
+            self.k_cache = k_cache_flat.reshape(
                 num_blocks, self.block_size, self.num_kv_heads, self.head_dim
             )
-            self.v_cache.value = v_cache_flat.reshape(
+            self.v_cache = v_cache_flat.reshape(
                 num_blocks, self.block_size, self.num_kv_heads, self.head_dim
             )
         

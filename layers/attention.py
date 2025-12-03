@@ -5,14 +5,8 @@ Implements multi-head attention with:
 - Support for both prefill (variable-length) and decode (single-token) phases
 - Optimized batched attention using JAX's vectorization
 - Flash Attention via jax.nn.dot_product_attention (XLA fused implementation)
-
-Optimizations:
-- Bucketed static arguments to reduce JIT recompilations
-- Buffer donation for KV cache updates
-- Fused attention kernels via XLA
 """
 
-import math
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -21,28 +15,6 @@ from typing import NamedTuple
 from functools import partial
 
 from nanovllm_jax.utils.context import AttentionContext
-
-
-# =============================================================================
-# Bucketing utilities to reduce JIT recompilations
-# =============================================================================
-
-def bucket_size(n: int, min_size: int = 16) -> int:
-    """Round up to next power of 2 for JIT cache efficiency.
-    
-    This reduces JIT recompilations from O(unique_lengths) to O(log(max_length)).
-    For example: 17 -> 32, 100 -> 128, 256 -> 256
-    
-    Args:
-        n: The size to bucket.
-        min_size: Minimum bucket size.
-    
-    Returns:
-        Power of 2 >= max(n, min_size).
-    """
-    if n <= min_size:
-        return min_size
-    return 2 ** math.ceil(math.log2(n))
 
 
 class KVCache(NamedTuple):
@@ -169,8 +141,8 @@ def variable_length_attention_prefill(
     v: jax.Array,  # [total_tokens, num_kv_heads, head_dim]
     cu_seqlens_q: jax.Array,  # [batch_size + 1]
     cu_seqlens_k: jax.Array,  # [batch_size + 1]
-    bucketed_max_seqlen_q: int,  # CHANGED: Bucketed (power of 2) for JIT cache
-    bucketed_max_seqlen_k: int,  # CHANGED: Bucketed (power of 2) for JIT cache
+    max_seqlen_q: int,
+    max_seqlen_k: int,
     num_heads: int,
     num_kv_heads: int,
     scale: float,
@@ -178,8 +150,6 @@ def variable_length_attention_prefill(
 ) -> jax.Array:
     """Variable-length attention for prefill - FULLY VECTORIZED.
     
-    OPTIMIZATION: Uses bucketed max_seqlen values (powers of 2) as static args
-    to reduce JIT recompilations from O(unique_lengths) to O(log(max_length)).
     Uses batched attention with padding and masking for GPU efficiency.
     This replaces the slow fori_loop implementation.
     
@@ -225,10 +195,6 @@ def variable_length_attention_prefill(
     # ==========================================================================
     # VECTORIZED padding using advanced indexing (replaces O(N) fori_loop)
     # ==========================================================================
-    
-    # Use bucketed sizes for static shape allocation (reduces recompilations)
-    max_seqlen_q = bucketed_max_seqlen_q
-    max_seqlen_k = bucketed_max_seqlen_k
     
     # Compute sequence lengths
     seq_lens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]  # [batch]
@@ -391,8 +357,8 @@ class Attention(nnx.Module):
             v=v,
             cu_seqlens_q=context.cu_seqlens_q,
             cu_seqlens_k=context.cu_seqlens_k,
-            bucketed_max_seqlen_q=context.max_seqlen_q,  # Already bucketed in context
-            bucketed_max_seqlen_k=context.max_seqlen_k,  # Already bucketed in context
+            max_seqlen_q=context.max_seqlen_q,
+            max_seqlen_k=context.max_seqlen_k,
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
             scale=self.scale,

@@ -5,22 +5,11 @@ explicitly through function calls for purity.
 
 The AttentionContext is registered as a JAX PyTree so it can be passed
 through JIT-compiled functions.
-
-OPTIMIZATION: Bucketed max_seqlen values (powers of 2) reduce JIT
-recompilations from O(unique_lengths) to O(log(max_length)).
 """
 
 from dataclasses import dataclass
-import math
 import jax
 import jax.numpy as jnp
-
-
-def _bucket_size(n: int, min_size: int = 16) -> int:
-    """Round up to next power of 2 for JIT cache efficiency."""
-    if n <= min_size:
-        return min_size
-    return 2 ** math.ceil(math.log2(n))
 
 
 @dataclass
@@ -38,8 +27,8 @@ class AttentionContext:
         # Prefill-specific (variable-length sequences):
         cu_seqlens_q: Cumulative sequence lengths for queries [num_seqs + 1].
         cu_seqlens_k: Cumulative sequence lengths for keys [num_seqs + 1].
-        max_seqlen_q: Maximum query sequence length (BUCKETED to power of 2).
-        max_seqlen_k: Maximum key sequence length (BUCKETED to power of 2).
+        max_seqlen_q: Maximum query sequence length in batch.
+        max_seqlen_k: Maximum key sequence length in batch.
         
         # Decode-specific (single token per sequence):
         context_lens: Current context length for each sequence [batch_size].
@@ -55,11 +44,11 @@ class AttentionContext:
     """
     is_prefill: bool = False
     
-    # Prefill metadata - max_seqlen values are BUCKETED to powers of 2
+    # Prefill metadata
     cu_seqlens_q: jnp.ndarray | None = None
     cu_seqlens_k: jnp.ndarray | None = None
-    max_seqlen_q: int = 0  # Bucketed to power of 2
-    max_seqlen_k: int = 0  # Bucketed to power of 2
+    max_seqlen_q: int = 0
+    max_seqlen_k: int = 0
     
     # Decode metadata  
     context_lens: jnp.ndarray | None = None
@@ -74,7 +63,7 @@ class AttentionContext:
 
 # Register AttentionContext as a JAX PyTree
 # Static fields (not traced): is_prefill, max_seqlen_q, max_seqlen_k
-# Dynamic fields (traced as arrays): cu_seqlens_q, cu_seqlens_k, context_lens,
+# Dynamic fields (traced as arrays): cu_seqlens_q, cu_seqlens_k, context_lens, 
 #                                     slot_mapping, block_tables, last_token_indices
 def _attention_context_flatten(ctx):
     """Flatten AttentionContext for PyTree registration."""
@@ -87,7 +76,7 @@ def _attention_context_flatten(ctx):
         ctx.block_tables,
         ctx.last_token_indices,
     )
-    # Aux data is the static fields (bucketed max_seqlen reduces recompilations)
+    # Aux data is the static fields
     aux_data = (ctx.is_prefill, ctx.max_seqlen_q, ctx.max_seqlen_k)
     return children, aux_data
 
@@ -141,16 +130,12 @@ def create_prefill_context(
     # Compute last token indices for LM head
     last_token_indices = cu_seqlens_q[1:] - 1
     
-    # OPTIMIZATION: Bucket sizes to powers of 2 to reduce JIT recompilations
-    bucketed_q = _bucket_size(max_seqlen_q)
-    bucketed_k = _bucket_size(max_seqlen_k)
-    
     return AttentionContext(
         is_prefill=True,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
-        max_seqlen_q=bucketed_q,  # Bucketed (static)
-        max_seqlen_k=bucketed_k,  # Bucketed (static)
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
         slot_mapping=slot_mapping,
         block_tables=block_tables,
         last_token_indices=last_token_indices,

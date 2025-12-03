@@ -160,8 +160,12 @@ for run in range(NUM_RUNS):
     nanovllm_times.append(elapsed)
     print(f"  Run {run+1}: {elapsed:.3f}s")
 
-# Calculate nano-vllm stats
-nanovllm_avg = sum(nanovllm_times) / len(nanovllm_times)
+# Calculate nano-vllm stats (exclude first run if it's significantly slower - JIT warmup)
+if len(nanovllm_times) > 1 and nanovllm_times[0] > 2 * nanovllm_times[1]:
+    print(f"  (Excluding Run 1 from average - JIT compilation overhead)")
+    nanovllm_avg = sum(nanovllm_times[1:]) / len(nanovllm_times[1:])
+else:
+    nanovllm_avg = sum(nanovllm_times) / len(nanovllm_times)
 nanovllm_tokens = sum(len(out['token_ids']) for out in nanovllm_outputs)
 nanovllm_tps = nanovllm_tokens / nanovllm_avg
 

@@ -38,8 +38,6 @@ def store_kv_to_cache(
 ) -> tuple[jax.Array, jax.Array]:
     """Store key and value tensors to paged cache (JIT compiled with buffer donation).
     
-    Optimized to avoid double-read from cache by using conditional assignment.
-    
     Args:
         key: Key tensor of shape [num_tokens, num_kv_heads, head_dim].
         value: Value tensor of shape [num_tokens, num_kv_heads, head_dim].
@@ -57,14 +55,13 @@ def store_kv_to_cache(
     # Replace -1 with 0 for indexing (will be masked out anyway)
     safe_slots = jnp.where(valid_mask, slot_mapping, 0)
     
-    # Optimized scatter: only update valid slots, avoid reading cache twice
-    # Use masked keys/values directly - invalid entries write garbage to slot 0
-    # but we don't care since slot 0 will be overwritten by valid data eventually
-    # or we ensure all tokens have valid slots (which is the case in practice)
+    # Cast to cache dtype for efficient memory bandwidth
+    key = key.astype(k_cache.dtype)
+    value = value.astype(v_cache.dtype)
+    
+    # Optimized scatter using JAX's indexed update
     k_cache = k_cache.at[safe_slots].set(key, mode='drop')
     v_cache = v_cache.at[safe_slots].set(value, mode='drop')
-    
-    return k_cache, v_cache
     
     return k_cache, v_cache
 
@@ -426,24 +423,31 @@ class Attention(nnx.Module):
         Returns:
             Output tensor with same shape as query.
         """
-        # Store K/V to cache
+        # Store K/V to cache (use views to avoid copies)
         if self.k_cache is not None and self.v_cache is not None:
-            # Flatten cache for slot-based indexing
-            k_cache_flat = self.k_cache.reshape(-1, self.num_kv_heads, self.head_dim)
-            v_cache_flat = self.v_cache.reshape(-1, self.num_kv_heads, self.head_dim)
+            num_blocks = self.k_cache.shape[0]
+            cache_shape = (num_blocks * self.block_size, self.num_kv_heads, self.head_dim)
+            
+            # Use reshape (no-copy view) for slot-based indexing
+            k_cache_flat = self.k_cache.reshape(cache_shape)
+            v_cache_flat = self.v_cache.reshape(cache_shape)
             
             k_cache_flat, v_cache_flat = store_kv_to_cache(
                 k, v, k_cache_flat, v_cache_flat, context.slot_mapping
             )
             
-            # Reshape back and update
-            num_blocks = self.k_cache.shape[0]
+            # Reshape back (no-copy view)
             self.k_cache = k_cache_flat.reshape(
                 num_blocks, self.block_size, self.num_kv_heads, self.head_dim
             )
             self.v_cache = v_cache_flat.reshape(
                 num_blocks, self.block_size, self.num_kv_heads, self.head_dim
             )
+        
+        if context.is_prefill:
+            return self._prefill_attention(q, k, v, context)
+        else:
+            return self._decode_attention(q, context)
         
         if context.is_prefill:
             return self._prefill_attention(q, k, v, context)

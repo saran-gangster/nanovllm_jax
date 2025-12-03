@@ -147,19 +147,20 @@ class ModelRunner:
         if config.num_kvcache_blocks > 0:
             num_blocks = config.num_kvcache_blocks
         else:
-            # Estimate: use small KV cache for Kaggle compatibility
-            # Each block stores: 2 * block_size * num_kv_heads * head_dim * num_layers * 4 bytes (fp32)
+            # Estimate: use reasonable KV cache for efficient inference
+            # Each block stores: 2 * block_size * num_kv_heads * head_dim * num_layers * 2 bytes (bf16)
             bytes_per_block = (
-                2 * self.block_size * num_kv_heads * head_dim * num_layers * 4
+                2 * self.block_size * num_kv_heads * head_dim * num_layers * 2
             )
-            target_memory = 256 * 1024 * 1024  # 256MB - very conservative for Kaggle
-            num_blocks = max(4, target_memory // bytes_per_block)  # At least 4 blocks
+            # Use more memory for better performance
+            target_memory = int(config.gpu_memory_utilization * 2 * 1024 * 1024 * 1024)  # 2GB * util
+            num_blocks = max(16, target_memory // bytes_per_block)  # At least 16 blocks
         
         config.num_kvcache_blocks = num_blocks
         print(f"Allocating {num_blocks} KV cache blocks")
         
         # Allocate KV cache: [2, num_layers, num_blocks, block_size, num_kv_heads, head_dim]
-        # Using float32 for universal GPU compatibility (bf16/fp16 not supported on all GPUs)
+        # Using bfloat16 for better memory bandwidth (2x faster than float32)
         kv_cache_shape = (2, num_layers, num_blocks, self.block_size, num_kv_heads, head_dim)
         
         if self.mesh is not None:
@@ -170,11 +171,11 @@ class ModelRunner:
                 P(None, None, None, None, "tp", None)  # Shard on kv_heads dimension
             )
             self.kv_cache = jax.device_put(
-                jnp.zeros(kv_cache_shape, dtype=jnp.float32),
+                jnp.zeros(kv_cache_shape, dtype=jnp.bfloat16),
                 kv_sharding
             )
         else:
-            self.kv_cache = jnp.zeros(kv_cache_shape, dtype=jnp.float32)
+            self.kv_cache = jnp.zeros(kv_cache_shape, dtype=jnp.bfloat16)
         
         # Wire KV cache to attention layers
         self._wire_kv_cache()

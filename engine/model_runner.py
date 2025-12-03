@@ -105,15 +105,10 @@ class ModelRunner:
     
     def _warmup_model(self):
         """Run a warmup pass to trigger lazy initialization."""
-        # Use shorter sequences for warmup to reduce memory pressure
-        # The actual max_model_len will work due to dynamic shapes
-        warmup_seq_len = min(128, self.config.max_model_len)  # Use shorter warmup
-        max_num_batched_tokens = self.config.max_num_batched_tokens
-        num_seqs = min(
-            max_num_batched_tokens // warmup_seq_len,
-            self.config.max_num_seqs,
-            4  # Limit to 4 sequences for warmup
-        )
+        # Use very short sequences for warmup to reduce memory pressure
+        # JIT will recompile for different shapes if needed
+        warmup_seq_len = 16  # Very short for minimal memory
+        num_seqs = 1  # Single sequence for warmup
         
         # Create dummy sequences
         seqs = [Sequence([0] * warmup_seq_len) for _ in range(num_seqs)]
@@ -151,13 +146,13 @@ class ModelRunner:
         if config.num_kvcache_blocks > 0:
             num_blocks = config.num_kvcache_blocks
         else:
-            # Estimate: assume we can store ~4GB of KV cache
+            # Estimate: assume we can store ~1GB of KV cache (conservative for Kaggle)
             # Each block stores: 2 * block_size * num_kv_heads * head_dim * num_layers * 2 bytes (bf16)
             bytes_per_block = (
                 2 * self.block_size * num_kv_heads * head_dim * num_layers * 2
             )
-            target_memory = 4 * 1024 * 1024 * 1024  # 4GB
-            num_blocks = target_memory // bytes_per_block
+            target_memory = 1 * 1024 * 1024 * 1024  # 1GB (reduced from 4GB)
+            num_blocks = max(8, target_memory // bytes_per_block)  # At least 8 blocks
         
         config.num_kvcache_blocks = num_blocks
         print(f"Allocating {num_blocks} KV cache blocks")

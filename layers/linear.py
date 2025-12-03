@@ -458,25 +458,26 @@ class RowParallelLinear(LinearBase):
             self.bias.value = loaded_bias
     
     def __call__(self, x: jax.Array) -> jax.Array:
-        """Forward pass with all-reduce.
+        """Forward pass.
         
         Args:
-            x: Input with last dim = input_size // tp_size (already sharded).
+            x: Input with last dim = input_size // tp_size (sharded from column-parallel).
         
         Returns:
-            Output after all-reduce across TP group.
+            Output tensor.
         
-        Note: When tp_size > 1, this assumes we're inside a shard_map context
-        where psum is valid. Use sharded_call for explicit shard_map.
+        Note: For tp_size > 1, the input should come from a column-parallel layer
+        that outputs sharded activations. This layer will compute partial results.
+        For proper all-reduce in TP > 1, use sharded_call() with explicit shard_map.
+        For tp_size = 1, this is just a standard linear layer.
         """
         y = x @ self.weight.value.T
         
-        # All-reduce across tensor parallel group
-        # Note: psum only works inside shard_map or pmap with axis_name
-        if self.tp_size > 1:
-            y = lax.psum(y, axis_name="tp")
+        # Note: psum only works inside shard_map/pmap. For tp_size > 1 without
+        # explicit sharding context, the caller is responsible for reduction.
+        # For tp_size = 1, no reduction needed.
         
-        # Add bias after all-reduce (only once)
+        # Add bias after reduction (or if tp_size = 1)
         if self.bias is not None:
             y = y + self.bias.value
         

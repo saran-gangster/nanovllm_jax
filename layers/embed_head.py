@@ -20,20 +20,19 @@ def divide(numerator: int, denominator: int) -> int:
 class VocabParallelEmbedding(nnx.Module):
     """Embedding layer with vocabulary parallelism.
     
-    The embedding table is sharded along the vocabulary dimension.
-    Each device holds vocab_size // tp_size rows.
+    For simplicity in JAX, we replicate the full embedding table on each device
+    when tp_size > 1. This avoids the complexity of all-reduce operations
+    that require shard_map contexts.
     
-    For tokens outside this device's range, we return zeros and use
-    all-reduce to combine results from all devices.
+    The weight loader will handle loading the appropriate shard if needed,
+    but for inference, replication is simpler and embedding lookup is fast.
     
     Attributes:
         num_embeddings: Total vocabulary size.
         embedding_dim: Dimension of embeddings.
-        tp_size: Tensor parallel world size.
-        tp_rank: This device's rank.
-        vocab_start_idx: Start of this device's vocabulary range.
-        vocab_end_idx: End of this device's vocabulary range.
-        weight: Embedding weight of shape [vocab_size // tp_size, embedding_dim].
+        tp_size: Tensor parallel world size (kept for API compatibility).
+        tp_rank: This device's rank (kept for API compatibility).
+        weight: Embedding weight of shape [vocab_size, embedding_dim].
     """
     
     def __init__(
@@ -45,37 +44,24 @@ class VocabParallelEmbedding(nnx.Module):
         *,
         rngs: nnx.Rngs,
     ):
-        assert num_embeddings % tp_size == 0, \
-            f"num_embeddings ({num_embeddings}) must be divisible by tp_size ({tp_size})"
-        
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.tp_size = tp_size
         self.tp_rank = tp_rank
         
-        self.num_embeddings_per_partition = num_embeddings // tp_size
-        self.vocab_start_idx = self.num_embeddings_per_partition * tp_rank
-        self.vocab_end_idx = self.vocab_start_idx + self.num_embeddings_per_partition
-        
-        # Initialize with small random values (will be overwritten by loader)
+        # Keep full embedding table (replicated across devices)
+        # This is simpler and avoids all-reduce complexity
         self.weight = nnx.Param(
-            jax.random.normal(rngs.params(), (self.num_embeddings_per_partition, embedding_dim)) * 0.01
+            jax.random.normal(rngs.params(), (num_embeddings, embedding_dim)) * 0.01
         )
     
     def load_weights(self, loaded_weight: jax.Array):
-        """Load weights with vocabulary sharding.
+        """Load weights (full table, replicated).
         
         Args:
             loaded_weight: Full embedding table of shape [vocab_size, embedding_dim].
         """
-        shard_size = self.num_embeddings_per_partition
-        start_idx = self.tp_rank * shard_size
-        
-        self.weight.value = lax.dynamic_slice(
-            loaded_weight,
-            (start_idx, 0),
-            (shard_size, self.embedding_dim)
-        )
+        self.weight.value = loaded_weight
     
     def __call__(self, x: jax.Array) -> jax.Array:
         """Look up embeddings for input token IDs.
@@ -86,42 +72,23 @@ class VocabParallelEmbedding(nnx.Module):
         Returns:
             Embeddings of shape [..., embedding_dim].
         """
-        if self.tp_size > 1:
-            # Create mask for tokens in this device's range
-            mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
-            # Adjust indices to local range
-            local_x = jnp.where(mask, x - self.vocab_start_idx, 0)
-        else:
-            local_x = x
-            mask = None
-        
-        # Look up embeddings
-        y = self.weight.value[local_x]
-        
-        if self.tp_size > 1:
-            # Zero out embeddings for tokens not in this device's range
-            y = jnp.where(mask[..., None], y, 0.0)
-            # All-reduce to combine from all devices
-            y = lax.psum(y, axis_name="tp")
-        
-        return y
+        return self.weight.value[x]
 
 
 class ParallelLMHead(nnx.Module):
     """Language model head with vocabulary parallelism.
     
-    Projects hidden states to vocabulary logits. The projection is sharded
-    across devices along the vocabulary dimension.
+    Projects hidden states to vocabulary logits. For simplicity in JAX,
+    we replicate the full projection weight on each device when tp_size > 1.
     
     In prefill mode, only processes the last token of each sequence.
-    After local projection, gathers results from all devices to rank 0.
     
     Attributes:
         num_embeddings: Total vocabulary size.
         embedding_dim: Input hidden dimension.
-        tp_size: Tensor parallel world size.
-        tp_rank: This device's rank.
-        weight: Projection weight of shape [vocab_size // tp_size, embedding_dim].
+        tp_size: Tensor parallel world size (kept for API compatibility).
+        tp_rank: This device's rank (kept for API compatibility).
+        weight: Projection weight of shape [vocab_size, embedding_dim].
     """
     
     def __init__(
@@ -133,35 +100,23 @@ class ParallelLMHead(nnx.Module):
         *,
         rngs: nnx.Rngs,
     ):
-        assert num_embeddings % tp_size == 0, \
-            f"num_embeddings ({num_embeddings}) must be divisible by tp_size ({tp_size})"
-        
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.tp_size = tp_size
         self.tp_rank = tp_rank
         
-        self.num_embeddings_per_partition = num_embeddings // tp_size
-        
-        # Initialize with small random values (will be overwritten by loader)
+        # Keep full weight (replicated across devices)
         self.weight = nnx.Param(
-            jax.random.normal(rngs.params(), (self.num_embeddings_per_partition, embedding_dim)) * 0.01
+            jax.random.normal(rngs.params(), (num_embeddings, embedding_dim)) * 0.01
         )
     
     def load_weights(self, loaded_weight: jax.Array):
-        """Load weights with vocabulary sharding.
+        """Load weights (full table, replicated).
         
         Args:
             loaded_weight: Full LM head weight of shape [vocab_size, embedding_dim].
         """
-        shard_size = self.num_embeddings_per_partition
-        start_idx = self.tp_rank * shard_size
-        
-        self.weight.value = lax.dynamic_slice(
-            loaded_weight,
-            (start_idx, 0),
-            (shard_size, self.embedding_dim)
-        )
+        self.weight.value = loaded_weight
     
     def __call__(
         self,
@@ -176,19 +131,13 @@ class ParallelLMHead(nnx.Module):
                 If None, processes all tokens.
         
         Returns:
-            Logits of shape [batch_size, vocab_size] on rank 0, None on other ranks.
+            Logits of shape [batch_size, vocab_size].
         """
         # In prefill mode, only process last token of each sequence
         if last_token_indices is not None:
             x = x[last_token_indices]
         
-        # Local projection: [batch, hidden] @ [hidden, vocab_shard] -> [batch, vocab_shard]
+        # Full projection: [batch, hidden] @ [hidden, vocab] -> [batch, vocab]
         logits = x @ self.weight.value.T
-        
-        if self.tp_size > 1:
-            # All-gather logits from all devices to get full vocabulary
-            # This gathers along the last dimension
-            all_logits = lax.all_gather(logits, axis_name="tp", axis=-1, tiled=True)
-            return all_logits
         
         return logits

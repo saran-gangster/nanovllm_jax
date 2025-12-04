@@ -132,8 +132,8 @@ def paged_decode_attention_kernel(
         # Map query head to KV head (for GQA)
         kv_head_idx = head_idx // q_heads_per_kv_head
         
-        # Load query for this (batch, head)
-        q_vec = q_ref[batch_idx, head_idx, :]  # [head_dim]
+        # Load query for this (batch, head) and cast to float32
+        q_vec = q_ref[batch_idx, head_idx, :].astype(jnp.float32)  # [head_dim]
         
         # Get context length for this sequence
         context_len = context_lens_ref[batch_idx]
@@ -168,11 +168,11 @@ def paged_decode_attention_kernel(
             block_end = jnp.minimum(block_start + block_size, context_len)
             valid_tokens = block_end - block_start
             
-            # Load K and V for this block
+            # Load K and V for this block and cast to float32 for computation
             # k_block: [block_size, head_dim]
             # v_block: [block_size, head_dim]
-            k_block = k_cache_ref[physical_block, :, kv_head_idx, :]  # [block_size, dim]
-            v_block = v_cache_ref[physical_block, :, kv_head_idx, :]  # [block_size, dim]
+            k_block = k_cache_ref[physical_block, :, kv_head_idx, :].astype(jnp.float32)
+            v_block = v_cache_ref[physical_block, :, kv_head_idx, :].astype(jnp.float32)
             
             # Compute attention scores: Q @ K^T with scaling
             # q_vec_2d: [1, head_dim], k_block: [block_size, head_dim]

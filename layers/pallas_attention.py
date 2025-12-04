@@ -70,7 +70,106 @@ def _check_pallas_available():
 
 
 # =============================================================================
-# Paged Decode Attention Kernel
+# Paged Decode Attention - Vectorized Implementation
+# =============================================================================
+
+@partial(jax.jit, static_argnums=(5, 6))
+def paged_decode_attention_vectorized(
+    q: jax.Array,           # [batch_size, num_heads, head_dim]
+    k_cache: jax.Array,     # [num_blocks, block_size, num_kv_heads, head_dim]
+    v_cache: jax.Array,     # [num_blocks, block_size, num_kv_heads, head_dim]
+    block_tables: jax.Array,  # [batch_size, max_blocks_per_seq]
+    context_lens: jax.Array,  # [batch_size]
+    scale: float,
+    block_size: int,
+) -> jax.Array:
+    """Optimized paged decode attention using vectorized operations.
+    
+    This version avoids Python loops and uses JAX's vectorization to achieve
+    better GPU utilization. The key optimization is:
+    1. Gather all relevant K/V blocks in one operation
+    2. Compute attention in parallel across all blocks
+    3. Use online softmax aggregation with vmap
+    
+    Args:
+        q: Query tensor [batch_size, num_heads, head_dim].
+        k_cache: Paged key cache [num_blocks, block_size, num_kv_heads, head_dim].
+        v_cache: Paged value cache [num_blocks, block_size, num_kv_heads, head_dim].
+        block_tables: Block indices for each sequence [batch_size, max_blocks_per_seq].
+        context_lens: Context length for each sequence [batch_size].
+        scale: Softmax scale factor.
+        block_size: Tokens per KV-cache block.
+    
+    Returns:
+        Output tensor [batch_size, num_heads, head_dim].
+    """
+    batch_size, num_heads, head_dim = q.shape
+    _, _, num_kv_heads, _ = k_cache.shape
+    max_blocks_per_seq = block_tables.shape[1]
+    max_context_len = max_blocks_per_seq * block_size
+    
+    # GQA ratio
+    q_heads_per_kv_head = num_heads // num_kv_heads
+    
+    # Clamp block indices to valid range
+    safe_block_tables = jnp.clip(block_tables, 0, k_cache.shape[0] - 1)
+    
+    # Gather K/V blocks: [batch, max_blocks] -> [batch, max_blocks, block_size, kv_heads, dim]
+    k_gathered = k_cache[safe_block_tables]  # [batch, max_blocks, block_size, kv_heads, dim]
+    v_gathered = v_cache[safe_block_tables]
+    
+    # Reshape to [batch, max_context_len, kv_heads, dim]
+    k_flat = k_gathered.reshape(batch_size, max_context_len, num_kv_heads, head_dim)
+    v_flat = v_gathered.reshape(batch_size, max_context_len, num_kv_heads, head_dim)
+    
+    # Expand KV heads for GQA: [batch, seq, kv_heads, dim] -> [batch, seq, num_heads, dim]
+    # Each KV head is repeated q_heads_per_kv_head times
+    k_expanded = jnp.repeat(k_flat, q_heads_per_kv_head, axis=2)  # [batch, seq, num_heads, dim]
+    v_expanded = jnp.repeat(v_flat, q_heads_per_kv_head, axis=2)
+    
+    # Cast to float32 for computation
+    q_f32 = q.astype(jnp.float32)  # [batch, num_heads, dim]
+    k_f32 = k_expanded.astype(jnp.float32)  # [batch, seq, num_heads, dim]
+    v_f32 = v_expanded.astype(jnp.float32)
+    
+    # Compute attention scores: Q @ K^T
+    # q: [batch, heads, dim] -> [batch, heads, 1, dim]
+    # k: [batch, seq, heads, dim] -> [batch, heads, seq, dim] (transpose)
+    q_expanded = q_f32[:, :, None, :]  # [batch, heads, 1, dim]
+    k_transposed = jnp.transpose(k_f32, (0, 2, 1, 3))  # [batch, heads, seq, dim]
+    
+    # Scaled dot-product: [batch, heads, 1, dim] @ [batch, heads, dim, seq] = [batch, heads, 1, seq]
+    scores = jnp.matmul(q_expanded, jnp.transpose(k_transposed, (0, 1, 3, 2))) * scale
+    scores = scores.squeeze(2)  # [batch, heads, seq]
+    
+    # Create attention mask based on context_lens
+    positions = jnp.arange(max_context_len)[None, None, :]  # [1, 1, seq]
+    mask = positions < context_lens[:, None, None]  # [batch, 1, seq]
+    
+    # Apply mask (use large negative value for masked positions)
+    scores = jnp.where(mask, scores, jnp.float32(-1e9))
+    
+    # Softmax
+    scores_max = scores.max(axis=-1, keepdims=True)
+    scores_exp = jnp.exp(scores - scores_max)
+    scores_exp = jnp.where(mask, scores_exp, 0.0)
+    scores_sum = scores_exp.sum(axis=-1, keepdims=True)
+    attn_weights = scores_exp / (scores_sum + 1e-9)  # [batch, heads, seq]
+    
+    # Weighted sum of values
+    # attn_weights: [batch, heads, seq] -> [batch, heads, seq, 1]
+    # v: [batch, seq, heads, dim] -> [batch, heads, seq, dim]
+    v_transposed = jnp.transpose(v_f32, (0, 2, 1, 3))  # [batch, heads, seq, dim]
+    attn_weights_expanded = attn_weights[:, :, :, None]  # [batch, heads, seq, 1]
+    
+    # Element-wise multiply and sum over seq dimension
+    output = (attn_weights_expanded * v_transposed).sum(axis=2)  # [batch, heads, dim]
+    
+    return output.astype(q.dtype)
+
+
+# =============================================================================
+# Paged Decode Attention Kernel (Pallas with loop - slower, for reference)
 # =============================================================================
 
 def paged_decode_attention_kernel(
@@ -323,22 +422,10 @@ def paged_attention(
     batch_size, num_heads, head_dim = q.shape
     _, _, num_kv_heads, _ = k_cache.shape
     
-    config = PagedAttentionConfig(
-        block_size=block_size,
-        num_heads=num_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
+    # Use the vectorized implementation (fastest)
+    return paged_decode_attention_vectorized(
+        q, k_cache, v_cache, block_tables, context_lens, scale, block_size
     )
-    
-    if PALLAS_AVAILABLE:
-        return paged_decode_attention_kernel(
-            q, k_cache, v_cache, block_tables, context_lens, scale, config
-        )
-    else:
-        # Fallback to standard JAX implementation
-        return _paged_attention_fallback(
-            q, k_cache, v_cache, block_tables, context_lens, scale, block_size
-        )
 
 
 def _paged_attention_fallback(
@@ -485,13 +572,13 @@ def test_paged_attention():
         head_dim=head_dim,
     )
     
-    # Test Pallas kernel
-    print("Testing Pallas paged attention...")
-    out_pallas = paged_decode_attention_kernel(
-        q, k_cache, v_cache, block_tables, context_lens, scale, config
+    # Test vectorized implementation
+    print("Testing vectorized paged attention...")
+    out_vectorized = paged_decode_attention_vectorized(
+        q, k_cache, v_cache, block_tables, context_lens, scale, block_size
     )
-    print(f"  Output shape: {out_pallas.shape}")
-    print(f"  Output dtype: {out_pallas.dtype}")
+    print(f"  Output shape: {out_vectorized.shape}")
+    print(f"  Output dtype: {out_vectorized.dtype}")
     
     # Test fallback
     print("Testing fallback implementation...")
@@ -500,7 +587,7 @@ def test_paged_attention():
     )
     
     # Compare outputs
-    diff = jnp.abs(out_pallas.astype(jnp.float32) - out_fallback.astype(jnp.float32))
+    diff = jnp.abs(out_vectorized.astype(jnp.float32) - out_fallback.astype(jnp.float32))
     max_diff = diff.max()
     mean_diff = diff.mean()
     
@@ -512,7 +599,7 @@ def test_paged_attention():
     else:
         print("✗ Test failed - outputs differ significantly")
     
-    return out_pallas, out_fallback
+    return out_vectorized, out_fallback
 
 
 if __name__ == "__main__":

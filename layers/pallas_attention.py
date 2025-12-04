@@ -153,6 +153,9 @@ def paged_decode_attention_kernel(
         log2e = jnp.float32(math.log2(math.e))
         scale_log2e = scale * log2e
         
+        # Reshape query for matrix multiply: [head_dim] -> [1, head_dim]
+        q_vec_2d = q_vec[None, :]  # [1, head_dim]
+        
         # Process each block in the sequence
         def process_block(block_idx, carry):
             m_i, l_i, acc = carry
@@ -171,10 +174,11 @@ def paged_decode_attention_kernel(
             k_block = k_cache_ref[physical_block, :, kv_head_idx, :]  # [block_size, dim]
             v_block = v_cache_ref[physical_block, :, kv_head_idx, :]  # [block_size, dim]
             
-            # Compute attention scores: q @ K^T with scaling
-            # q_vec: [head_dim], k_block: [block_size, head_dim]
-            # scores: [block_size]
-            scores = jnp.dot(k_block, q_vec) * scale_log2e  # In log2 space
+            # Compute attention scores: Q @ K^T with scaling
+            # q_vec_2d: [1, head_dim], k_block: [block_size, head_dim]
+            # Use matmul: Q @ K^T = [1, head_dim] @ [head_dim, block_size] = [1, block_size]
+            scores = jnp.matmul(q_vec_2d, k_block.T) * scale_log2e  # [1, block_size]
+            scores = scores.squeeze(0)  # [block_size]
             
             # Mask invalid positions (tokens beyond context_len within this block)
             token_indices = jnp.arange(block_size)
@@ -200,8 +204,12 @@ def paged_decode_attention_kernel(
             l_new = alpha * l_i + p.sum()
             
             # Update accumulator: acc = alpha * acc + p @ V
-            # p: [block_size], v_block: [block_size, head_dim]
-            acc_new = alpha * acc + jnp.dot(p, v_block)  # [head_dim]
+            # p: [block_size] -> p_2d: [1, block_size]
+            # v_block: [block_size, head_dim]
+            # Use matmul: [1, block_size] @ [block_size, head_dim] = [1, head_dim]
+            p_2d = p[None, :]  # [1, block_size]
+            pv = jnp.matmul(p_2d, v_block)  # [1, head_dim]
+            acc_new = alpha * acc + pv.squeeze(0)  # [head_dim]
             
             return m_new, l_new, acc_new
         

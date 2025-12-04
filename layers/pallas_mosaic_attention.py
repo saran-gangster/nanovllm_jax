@@ -288,6 +288,10 @@ def batched_decode_attention_mosaic(
     """
     _check_mosaic_available()
     
+    # Extract shapes first (needed for _prepare_decode_tiles)
+    batch_size, num_heads, head_dim = q.shape
+    num_kv_blocks, kv_block_size, num_kv_heads, _ = k_cache.shape
+    
     block_q = config.block_q
     block_kv = config.block_kv
     max_concurrent_steps = config.max_concurrent_steps
@@ -318,8 +322,8 @@ def batched_decode_attention_mosaic(
         block_kv,
     )
 
+    # Re-extract shapes after padding
     batch_size, num_heads, head_dim = q.shape
-    num_kv_blocks, kv_block_size, num_kv_heads, _ = k_cache.shape
     max_blocks_per_seq = block_tables.shape[1]
 
     # Use a single compute warpgroup so each WGMMA sees block_q rows.

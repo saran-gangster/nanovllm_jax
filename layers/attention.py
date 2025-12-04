@@ -5,6 +5,7 @@ Implements multi-head attention with:
 - Support for both prefill (variable-length) and decode (single-token) phases
 - Optimized batched attention using JAX's vectorization
 - Flash Attention via jax.nn.dot_product_attention (XLA fused implementation)
+- Pallas kernels for high-performance paged decode attention (when available)
 """
 
 import jax
@@ -15,6 +16,16 @@ from typing import NamedTuple
 from functools import partial
 
 from nanovllm_jax.utils.context import AttentionContext
+
+# Try to import Pallas attention kernel
+try:
+    from nanovllm_jax.layers.pallas_attention import (
+        paged_attention as pallas_paged_attention,
+        PALLAS_AVAILABLE,
+    )
+except ImportError:
+    PALLAS_AVAILABLE = False
+    pallas_paged_attention = None
 
 
 class KVCache(NamedTuple):
@@ -359,6 +370,9 @@ class Attention(nnx.Module):
     ) -> jax.Array:
         """Attention for decode phase with single query token per sequence.
         
+        Uses Pallas paged attention kernel when available, which avoids
+        gathering K/V into dense tensors (major performance improvement).
+        
         Args:
             q: Query tensor [batch_size, num_heads, head_dim].
             context: Attention context with cache info.
@@ -366,7 +380,23 @@ class Attention(nnx.Module):
         Returns:
             Output tensor [batch_size, num_heads, head_dim].
         """
-        # Gather K/V from paged cache
+        # Try to use Pallas paged attention kernel (avoids gather overhead)
+        if PALLAS_AVAILABLE and pallas_paged_attention is not None:
+            # Cast query to cache dtype for consistent ops
+            target_dtype = self.k_cache.dtype if self.k_cache is not None else q.dtype
+            q = q.astype(target_dtype)
+            
+            return pallas_paged_attention(
+                q=q,
+                k_cache=self.k_cache,
+                v_cache=self.v_cache,
+                block_tables=context.block_tables,
+                context_lens=context.context_lens,
+                scale=self.scale,
+                block_size=self.block_size,
+            )
+        
+        # Fallback: Gather K/V from paged cache (slower path)
         # k_gathered, v_gathered: [batch, max_context_len, kv_heads, dim]
         # kv_mask: [batch, max_context_len]
         k_gathered, v_gathered, kv_mask = gather_kv_from_cache(

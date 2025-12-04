@@ -430,29 +430,20 @@ def paged_attention(
     batch_size, num_heads, head_dim = q.shape
     _, block_size_cache, num_kv_heads, _ = k_cache.shape
 
-    if MOSAIC_AVAILABLE and mosaic_attn is not None:
-        block_q = 64
-        block_kv = 64
-        if block_size_cache % block_kv == 0:
-            mosaic_config = mosaic_attn.MosaicAttentionConfig(
-                block_q=block_q,
-                block_kv=block_kv,
-                max_concurrent_steps=min(4, block_size_cache // block_kv),
-                use_schedule_barrier=True,
-                num_compute_wgs=2,
-            )
-            try:
-                return mosaic_attn.batched_decode_attention_mosaic(
-                    q,
-                    k_cache,
-                    v_cache,
-                    block_tables,
-                    context_lens,
-                    scale,
-                    mosaic_config,
-                )
-            except (RuntimeError, ValueError):
-                pass
+    # TODO: Re-enable Mosaic decode kernel once alignment issues are resolved.
+    # The batched_decode_attention_mosaic kernel has strict memory alignment
+    # requirements (multiples of 128) that need further work.
+    # For now, use the vectorized fallback which is already well-optimized.
+    #
+    # if MOSAIC_AVAILABLE and mosaic_attn is not None:
+    #     block_q = 64
+    #     block_kv = 64
+    #     if block_size_cache % block_kv == 0:
+    #         mosaic_config = mosaic_attn.MosaicAttentionConfig(...)
+    #         try:
+    #             return mosaic_attn.batched_decode_attention_mosaic(...)
+    #         except (RuntimeError, ValueError):
+    #             pass
 
     return paged_decode_attention_vectorized(
         q, k_cache, v_cache, block_tables, context_lens, scale, block_size

@@ -40,6 +40,14 @@ except ImportError:
     pl = None
     plgpu = None
 
+# Optional true Mosaic GPU kernels
+try:
+    from . import pallas_mosaic_attention as mosaic_attn
+    MOSAIC_AVAILABLE = mosaic_attn.MOSAIC_AVAILABLE
+except ImportError:
+    MOSAIC_AVAILABLE = False
+    mosaic_attn = None
+
 
 class PagedAttentionConfig(NamedTuple):
     """Configuration for paged attention kernel.
@@ -420,9 +428,32 @@ def paged_attention(
         Output tensor [batch_size, num_heads, head_dim].
     """
     batch_size, num_heads, head_dim = q.shape
-    _, _, num_kv_heads, _ = k_cache.shape
-    
-    # Use the vectorized implementation (fastest)
+    _, block_size_cache, num_kv_heads, _ = k_cache.shape
+
+    if MOSAIC_AVAILABLE and mosaic_attn is not None:
+        block_q = 64
+        block_kv = 64
+        if block_size_cache % block_kv == 0:
+            mosaic_config = mosaic_attn.MosaicAttentionConfig(
+                block_q=block_q,
+                block_kv=block_kv,
+                max_concurrent_steps=min(4, block_size_cache // block_kv),
+                use_schedule_barrier=True,
+                num_compute_wgs=2,
+            )
+            try:
+                return mosaic_attn.batched_decode_attention_mosaic(
+                    q,
+                    k_cache,
+                    v_cache,
+                    block_tables,
+                    context_lens,
+                    scale,
+                    mosaic_config,
+                )
+            except (RuntimeError, ValueError):
+                pass
+
     return paged_decode_attention_vectorized(
         q, k_cache, v_cache, block_tables, context_lens, scale, block_size
     )
@@ -503,6 +534,33 @@ def paged_prefill_attention(
     Returns:
         Output tensor [total_tokens, num_heads, head_dim].
     """
+    if MOSAIC_AVAILABLE and mosaic_attn is not None:
+        block_q = 64
+        block_kv = 64
+        if max_seqlen >= block_q:
+            mosaic_config = mosaic_attn.MosaicAttentionConfig(
+                block_q=block_q,
+                block_kv=block_kv,
+                max_concurrent_steps=max(
+                    2,
+                    min(4, max(1, max_seqlen // block_kv)),
+                ),
+                use_schedule_barrier=True,
+                num_compute_wgs=2,
+            )
+            try:
+                mosaic_out, _ = mosaic_attn.prefill_attention_mosaic_api(
+                    q=q,
+                    k=k,
+                    v=v,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    scale=scale,
+                    config=mosaic_config,
+                )
+                return mosaic_out
+            except (RuntimeError, ValueError):
+                pass
     # Import the existing implementation
     from nanovllm_jax.layers.attention import variable_length_attention_prefill
     

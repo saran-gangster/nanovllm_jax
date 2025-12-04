@@ -25,3 +25,20 @@ try:
     )
 except ImportError:
     PALLAS_AVAILABLE = False
+
+# True Mosaic GPU kernels (optional, requires Hopper+ GPU)
+try:
+    from nanovllm_jax.layers.pallas_mosaic_attention import (
+        MosaicAttentionConfig,
+        batched_decode_attention_mosaic,
+        prefill_attention_mosaic,
+        paged_attention_mosaic,
+        prefill_attention_mosaic_api,
+        paged_decode_attention_mosaic_v2,
+        simple_attention_wgmma,
+        batched_decode_emit_pipeline,
+        PagedKVBlockInfo,
+        MOSAIC_AVAILABLE,
+    )
+except ImportError:
+    MOSAIC_AVAILABLE = False

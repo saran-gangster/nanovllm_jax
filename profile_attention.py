@@ -43,18 +43,19 @@ print("=" * 70)
 
 # Test 1: Vectorized decode (current fallback)
 print("\n[1] Profiling vectorized decode (current fallback)...")
-vectorized_fn = jax.jit(pallas_attention.paged_decode_attention_vectorized)
+scale_float = float(scale)
+vectorized_fn = jax.jit(pallas_attention.paged_decode_attention_vectorized, static_argnames=['scale', 'block_size'])
 
 # Warmup
 for _ in range(5):
-    _ = vectorized_fn(q, k_cache, v_cache, block_tables, context_lens, scale, block_size)
+    _ = vectorized_fn(q, k_cache, v_cache, block_tables, context_lens, scale_float, block_size)
 jax.block_until_ready(_)
 
 # Benchmark
 times = []
 for i in range(num_runs):
     start = time.perf_counter()
-    out = vectorized_fn(q, k_cache, v_cache, block_tables, context_lens, scale, block_size)
+    out = vectorized_fn(q, k_cache, v_cache, block_tables, context_lens, scale_float, block_size)
     jax.block_until_ready(out)
     elapsed = time.perf_counter() - start
     times.append(elapsed * 1000)  # Convert to ms
@@ -84,7 +85,7 @@ try:
     )
     
     prefill_fn = jax.jit(lambda q, k, v, cu: pallas_mosaic_attention.variable_length_attention_mosaic(
-        q, k, v, cu, scale, config
+        q, k, v, cu, scale_float, config
     ))
     
     # Warmup
@@ -113,18 +114,18 @@ print("\n[3] Comparing decode implementations...")
 
 # 3a. Standard Flash Attention (if available)
 try:
-    standard_fn = jax.jit(pallas_attention._paged_attention_fallback)
+    standard_fn = jax.jit(pallas_attention._paged_attention_fallback, static_argnames=['scale', 'block_size'])
     
     # Warmup
     for _ in range(5):
-        _ = standard_fn(q, k_cache, v_cache, block_tables, context_lens, scale, block_size)
+        _ = standard_fn(q, k_cache, v_cache, block_tables, context_lens, scale_float, block_size)
     jax.block_until_ready(_)
     
     # Benchmark
     times = []
     for i in range(num_runs):
         start = time.perf_counter()
-        out = standard_fn(q, k_cache, v_cache, block_tables, context_lens, scale, block_size)
+        out = standard_fn(q, k_cache, v_cache, block_tables, context_lens, scale_float, block_size)
         jax.block_until_ready(out)
         elapsed = time.perf_counter() - start
         times.append(elapsed * 1000)
@@ -186,7 +187,7 @@ def single_seq_attention(q_seq, k_blocks, v_blocks, context_len):
     v_flat = v_blocks.reshape(-1, num_heads, head_dim)
     
     # Compute attention scores
-    scores = jnp.einsum('hd,nhd->hn', q_seq, k_flat) * scale
+    scores = jnp.einsum('hd,nhd->hn', q_seq, k_flat) * scale_float
     
     # Mask
     mask = jnp.arange(k_flat.shape[0]) < context_len

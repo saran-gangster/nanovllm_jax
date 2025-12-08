@@ -19,7 +19,7 @@ def test_mosaic_decode():
     print("="*60)
     
     try:
-        from layers.pallas_attention import (
+        from nanovllm_jax.layers.pallas_attention import (
             paged_attention,
             MOSAIC_AVAILABLE,
         )
@@ -94,7 +94,7 @@ def test_mosaic_prefill():
     print("="*60)
     
     try:
-        from layers.pallas_attention import (
+        from nanovllm_jax.layers.pallas_attention import (
             paged_prefill_attention,
             MOSAIC_AVAILABLE,
         )
@@ -166,7 +166,7 @@ def test_smem_budget():
     print("="*60)
     
     try:
-        from layers.pallas_mosaic_attention import (
+        from nanovllm_jax.layers.pallas_mosaic_attention import (
             _cap_pipeline_depth,
             _SMEM_BUDGET_BYTES,
         )
@@ -228,7 +228,7 @@ def test_per_sequence_blocks():
     print("="*60)
     
     try:
-        from layers.pallas_attention import paged_attention
+        from nanovllm_jax.layers.pallas_attention import paged_attention
         
         # Small test with different block patterns
         batch_size = 4

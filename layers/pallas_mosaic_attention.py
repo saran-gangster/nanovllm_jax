@@ -85,6 +85,71 @@ class MosaicAttentionConfig:
             raise ValueError(f"max_concurrent_steps={self.max_concurrent_steps} must be >= 2")
 
 
+_SMEM_BUDGET_BYTES = 232_448  # 228 KB on Hopper (in bytes)
+_METADATA_ALIGNMENT = 128
+_BARRIER_BYTES_PER_SLOT = 16  # heuristic: small allowance per barrier slot
+
+
+def _pad_last_dim_to_multiple(
+    arr: jax.Array,
+    multiple: int = _METADATA_ALIGNMENT,
+    pad_value: int | float = 0,
+):
+    """Right-pad the last dimension so Mosaic layout casts meet alignment rules."""
+
+    last_dim = arr.shape[-1]
+    pad = (-last_dim) % multiple
+    if pad == 0:
+        return arr
+    pad_width = [(0, 0)] * (arr.ndim - 1) + [(0, pad)]
+    return jnp.pad(arr, pad_width, constant_values=pad_value)
+
+
+def _cap_pipeline_depth(
+    *,
+    block_q: int,
+    block_kv: int,
+    head_dim: int,
+    dtype,
+    num_compute_wgs: int,
+    requested_steps: int,
+    extra_smem_bytes: int = 0,
+    include_barrier_overhead: bool = True,
+    metadata_bytes: int = 0,
+):
+    """Clamp max_concurrent_steps so SMEM usage never exceeds the Hopper budget."""
+
+    dtype_size = jnp.dtype(dtype).itemsize
+    base_qo_bytes = num_compute_wgs * block_q * head_dim * dtype_size * 2  # Q + O tiles
+
+    barrier_bytes = 0
+    if include_barrier_overhead:
+        barrier_slots = 4 * requested_steps + num_compute_wgs + 1  # k,v,q,consumed,schedule
+        barrier_bytes = barrier_slots * _BARRIER_BYTES_PER_SLOT
+
+    base_bytes = base_qo_bytes + extra_smem_bytes + barrier_bytes + metadata_bytes
+    available = _SMEM_BUDGET_BYTES - base_bytes
+    if available <= 0:
+        raise ValueError(
+            "Mosaic kernel configuration exhausts shared memory before staging K/V. "
+            "Reduce block_q, head_dim, or the number of compute warpgroups."
+        )
+
+    per_step_bytes = block_kv * head_dim * dtype_size * 2  # K + V per pipeline stage
+    if per_step_bytes <= 0:
+        raise ValueError("block_kv and head_dim must be positive for Mosaic kernels")
+
+    if available < per_step_bytes:
+        raise ValueError(
+            "Insufficient shared memory for a single KV tile. "
+            "Decrease block_kv or head_dim to proceed with Mosaic decode."
+        )
+
+    max_steps_possible = available // per_step_bytes
+    effective_steps = max(1, min(requested_steps, max_steps_possible))
+    return effective_steps
+
+
 # =============================================================================
 # Decode Utility Helpers
 # =============================================================================
@@ -171,19 +236,29 @@ def _prepare_decode_tiles(
     row_lengths = context_tile.astype(jnp.int32)
     row_offsets = jnp.cumsum(row_lengths, axis=1, dtype=jnp.int32) - row_lengths
 
+    # Pad metadata so Mosaic layout requirements (multiples of 128) are satisfied.
+    tile_row_offsets = _pad_last_dim_to_multiple(row_offsets)
+    tile_row_lengths = _pad_last_dim_to_multiple(row_lengths)
+    tile_chunk_block_indices = _pad_last_dim_to_multiple(chunk_block_indices)
+    tile_chunk_offsets = _pad_last_dim_to_multiple(chunk_offsets)
+    tile_chunk_tokens = _pad_last_dim_to_multiple(chunk_tokens)
+    tile_chunk_prefix_tokens = _pad_last_dim_to_multiple(chunk_prefix)
+    tile_chunk_row_indices = _pad_last_dim_to_multiple(chunk_row_indices)
+    tile_chunk_logical_blocks = _pad_last_dim_to_multiple(chunk_logical_blocks)
+
     return (
         q,
         block_tables,
         context_lens,
         tile_valid_counts,
-        row_offsets,
-        row_lengths,
-        chunk_block_indices,
-        chunk_offsets,
-        chunk_tokens,
-        chunk_prefix,
-        chunk_row_indices,
-        chunk_logical_blocks,
+        tile_row_offsets,
+        tile_row_lengths,
+        tile_chunk_block_indices,
+        tile_chunk_offsets,
+        tile_chunk_tokens,
+        tile_chunk_prefix_tokens,
+        tile_chunk_row_indices,
+        tile_chunk_logical_blocks,
         tile_chunk_counts,
         original_batch_size,
     )
@@ -294,7 +369,14 @@ def batched_decode_attention_mosaic(
     
     block_q = config.block_q
     block_kv = config.block_kv
-    max_concurrent_steps = config.max_concurrent_steps
+    requested_steps = config.max_concurrent_steps
+    num_compute_wgs = 1
+
+    if kv_block_size % block_kv != 0:
+        raise ValueError(
+            "KV cache block_size must be divisible by block_kv for Mosaic decode. "
+            f"Received block_size={kv_block_size}, block_kv={block_kv}."
+        )
 
     # Decode issues one token per sequence, so we batch block_q sequences together
     # (block_q ≥ 64) to satisfy WGMMA M dimension requirements.
@@ -327,7 +409,26 @@ def batched_decode_attention_mosaic(
     max_blocks_per_seq = block_tables.shape[1]
 
     # Use a single compute warpgroup so each WGMMA sees block_q rows.
-    num_compute_wgs = 1
+    meta_bytes = (
+        tile_row_offsets.size
+        + tile_row_lengths.size
+        + tile_chunk_block_indices.size
+        + tile_chunk_offsets.size
+        + tile_chunk_tokens.size
+        + tile_chunk_prefix_tokens.size
+        + tile_chunk_row_indices.size
+        + tile_chunk_logical_blocks.size
+    ) * jnp.dtype(jnp.int32).itemsize
+
+    max_concurrent_steps = _cap_pipeline_depth(
+        block_q=block_q,
+        block_kv=block_kv,
+        head_dim=head_dim,
+        dtype=q.dtype,
+        num_compute_wgs=num_compute_wgs,
+        requested_steps=requested_steps,
+        metadata_bytes=meta_bytes,
+    )
     
     # GQA: query heads per KV head
     q_heads_per_kv_head = num_heads // num_kv_heads
@@ -761,8 +862,8 @@ def prefill_attention_mosaic(
     
     block_q = config.block_q
     block_kv = config.block_kv
-    max_concurrent_steps = config.max_concurrent_steps
     num_compute_wgs = config.num_compute_wgs
+    requested_steps = config.max_concurrent_steps
     
     # GQA ratio
     q_heads_per_kv_head = num_heads // num_kv_heads
@@ -772,6 +873,19 @@ def prefill_attention_mosaic(
     
     # Compute SMEM transforms
     transforms = get_smem_transforms(head_dim, q.dtype)
+
+    lse_bytes = num_compute_wgs * block_q * jnp.dtype(jnp.float32).itemsize
+    meta_bytes = 0  # Prefill metadata remains small; adjust if padding is added later.
+    max_concurrent_steps = _cap_pipeline_depth(
+        block_q=block_q,
+        block_kv=block_kv,
+        head_dim=head_dim,
+        dtype=q.dtype,
+        num_compute_wgs=num_compute_wgs,
+        requested_steps=requested_steps,
+        extra_smem_bytes=lse_bytes,
+        metadata_bytes=meta_bytes,
+    )
     
     def kernel_entry(q_ref, k_ref, v_ref, cu_seqlens_ref, out_ref, lse_ref):
         """Kernel entry with SMEM allocation."""
@@ -940,11 +1054,17 @@ def prefill_attention_mosaic(
 
                     qk = qk * scale
 
-                    q_ids = plgpu.broadcasted_iota(
-                        jnp.int32, (block_q, block_kv), 0, layout=plgpu.Layout.WGMMA
+                    q_ids = plgpu.layout_cast(
+                        plgpu.broadcasted_iota(
+                            jnp.int32, (block_q, block_kv), 0, layout=plgpu.Layout.WGMMA
+                        ),
+                        plgpu.Layout.WGMMA,
                     )
-                    kv_ids = plgpu.broadcasted_iota(
-                        jnp.int32, (block_q, block_kv), 1, layout=plgpu.Layout.WGMMA
+                    kv_ids = plgpu.layout_cast(
+                        plgpu.broadcasted_iota(
+                            jnp.int32, (block_q, block_kv), 1, layout=plgpu.Layout.WGMMA
+                        ),
+                        plgpu.Layout.WGMMA,
                     )
                     q_positions = tile_info.block_start + q_ids
                     kv_positions = kv_step * block_kv + kv_ids
@@ -1279,22 +1399,24 @@ def paged_decode_attention_mosaic_v2(
                 
                 kv_pos_in_block = kv_tile_idx * block_kv
                 
-                # For simplicity, load K/V for first sequence's physical block
-                # TODO: Handle per-sequence physical blocks properly
-                first_physical_block = physical_blocks[0]
-                
-                # Load K: [block_kv, head_dim]
-                k_block = k_cache_ref[first_physical_block, 
-                                       kv_pos_in_block:kv_pos_in_block + block_kv,
-                                       kv_head_idx, :].astype(jnp.float32)
-                
-                # Load V: [block_kv, head_dim]  
-                v_block = v_cache_ref[first_physical_block,
-                                       kv_pos_in_block:kv_pos_in_block + block_kv,
-                                       kv_head_idx, :].astype(jnp.float32)
-                
-                # QK^T: [block_q, head_dim] @ [head_dim, block_kv] = [block_q, block_kv]
-                scores = jnp.matmul(q_local, k_block.T) * scale
+                safe_blocks = jnp.clip(physical_blocks, 0, num_kv_blocks - 1)
+
+                k_block = k_cache_ref[
+                    safe_blocks,
+                    kv_pos_in_block:kv_pos_in_block + block_kv,
+                    kv_head_idx,
+                    :,
+                ].astype(jnp.float32)
+                v_block = v_cache_ref[
+                    safe_blocks,
+                    kv_pos_in_block:kv_pos_in_block + block_kv,
+                    kv_head_idx,
+                    :,
+                ].astype(jnp.float32)
+
+                # QK^T per sequence: [block_q, head_dim] @ [block_q, block_kv, head_dim]^T
+                # -> [block_q, block_kv]
+                scores = jnp.einsum("q h, qkh->qk", q_local, k_block) * scale
                 
                 # Mask invalid positions
                 kv_positions = jnp.arange(block_kv) + block_start_pos + kv_pos_in_block

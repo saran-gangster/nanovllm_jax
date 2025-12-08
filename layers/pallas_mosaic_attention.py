@@ -590,17 +590,13 @@ def batched_decode_attention_mosaic(
             plgpu.barrier_wait(q_barriers.at[wg_idx])
 
             # Zero out padded rows so they do not contribute to attention
-            row_ids = plgpu.broadcasted_iota(
-                jnp.int32, (block_q,), 0, layout=plgpu.Layout.ROW_MAJOR
-            )
+            row_ids = plgpu.broadcasted_iota(jnp.int32, (block_q,), 0)
             row_mask_row = row_ids < tile_count
             row_mask_2d = row_mask_row[:, None].astype(q.dtype)
             qo_tile = qo_smem.at[wg_idx][...]
             qo_tile = qo_tile * row_mask_2d
             qo_smem.at[wg_idx][...] = qo_tile
-            row_indices = plgpu.broadcasted_iota(
-                jnp.int32, (block_q,), 0, layout=plgpu.Layout.ROW_MAJOR
-            )
+            row_indices = plgpu.broadcasted_iota(jnp.int32, (block_q,), 0)
             tile_chunk_rows = tile_chunk_row_indices_ref[batch_tile_idx]
             tile_chunk_tokens = tile_chunk_tokens_ref[batch_tile_idx]
             tile_chunk_prefix = tile_chunk_prefix_tokens_ref[batch_tile_idx]
@@ -666,9 +662,7 @@ def batched_decode_attention_mosaic(
                 chunk_prefix = tile_chunk_prefix[kv_step]
 
                 row_active = (row_indices == chunk_row) & row_mask_row
-                col_ids = plgpu.broadcasted_iota(
-                    jnp.int32, (block_kv,), 0, layout=plgpu.Layout.ROW_MAJOR
-                )
+                col_ids = plgpu.broadcasted_iota(jnp.int32, (block_kv,), 0)
                 kv_pos = chunk_prefix + col_ids
                 col_mask = kv_pos < (chunk_prefix + chunk_tokens)
                 mask = row_active[:, None] & col_mask[None, :]
@@ -1012,9 +1006,7 @@ def prefill_attention_mosaic(
                     smem_cursor = smem_cursor + (tile_rows & rows)
                     gmem_cursor = gmem_cursor + (tile_rows & rows)
 
-                row_ids = plgpu.broadcasted_iota(
-                    jnp.int32, (block_q,), 0, layout=plgpu.Layout.ROW_MAJOR
-                )
+                row_ids = plgpu.broadcasted_iota(jnp.int32, (block_q,), 0)
                 valid_start = tile_info.start_within_block
                 valid_end = valid_start + tile_rows
                 row_mask = (row_ids >= valid_start) & (row_ids < valid_end)
@@ -1389,9 +1381,7 @@ def paged_decode_attention_mosaic_v2(
             
             # Get physical blocks for all sequences in tile
             # physical_blocks: [block_q] - one per sequence
-            seq_indices = plgpu.broadcasted_iota(
-                jnp.int32, (block_q,), 0, layout=plgpu.Layout.ROW_MAJOR
-            ) + batch_start
+            seq_indices = plgpu.broadcasted_iota(jnp.int32, (block_q,), 0) + batch_start
             seq_indices = jnp.minimum(seq_indices, batch_size - 1)
             physical_blocks = block_tables_ref[seq_indices, logical_block_idx]
             
@@ -1429,9 +1419,7 @@ def paged_decode_attention_mosaic_v2(
                 scores = jnp.einsum("q h, qkh->qk", q_local, k_block) * scale
                 
                 # Mask invalid positions
-                kv_positions = plgpu.broadcasted_iota(
-                    jnp.int32, (block_kv,), 0, layout=plgpu.Layout.ROW_MAJOR
-                ) + block_start_pos + kv_pos_in_block
+                kv_positions = plgpu.broadcasted_iota(jnp.int32, (block_kv,), 0) + block_start_pos + kv_pos_in_block
                 # Per-sequence masking based on context_lens
                 seq_mask = kv_positions[None, :] < tile_context_lens[:actual_batch_size, None]
                 # Pad mask to block_q

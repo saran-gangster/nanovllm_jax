@@ -1,12 +1,12 @@
 """Utility functions and classes."""
 
-from nanovllm_jax.utils.context import (
+from .context import (
     AttentionContext,
     create_prefill_context,
     create_decode_context,
 )
-from nanovllm_jax.utils.loader import load_model, load_model_sharded
-from nanovllm_jax.utils.parallel import (
+from .loader import load_model, load_model_sharded
+from .parallel import (
     create_tp_mesh,
     get_tp_sharding,
     TPContext,

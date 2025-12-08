@@ -1,6 +1,6 @@
 """Neural network layers for LLM inference."""
 
-from nanovllm_jax.layers.linear import (
+from .linear import (
     LinearBase,
     ReplicatedLinear,
     ColumnParallelLinear,
@@ -8,16 +8,16 @@ from nanovllm_jax.layers.linear import (
     QKVParallelLinear,
     MergedColumnParallelLinear,
 )
-from nanovllm_jax.layers.attention import Attention, KVCache
-from nanovllm_jax.layers.rotary_embedding import RotaryEmbedding, get_rope, apply_rotary_emb
-from nanovllm_jax.layers.layernorm import RMSNorm
-from nanovllm_jax.layers.activation import SiluAndMul
-from nanovllm_jax.layers.sampler import Sampler
-from nanovllm_jax.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from .attention import Attention, KVCache
+from .rotary_embedding import RotaryEmbedding, get_rope, apply_rotary_emb
+from .layernorm import RMSNorm
+from .activation import SiluAndMul
+from .sampler import Sampler
+from .embed_head import VocabParallelEmbedding, ParallelLMHead
 
 # Pallas kernels (optional, depends on JAX version)
 try:
-    from nanovllm_jax.layers.pallas_attention import (
+    from .pallas_attention import (
         paged_attention,
         paged_decode_attention_kernel,
         PagedAttentionConfig,
@@ -28,7 +28,7 @@ except ImportError:
 
 # True Mosaic GPU kernels (optional, requires Hopper+ GPU)
 try:
-    from nanovllm_jax.layers.pallas_mosaic_attention import (
+    from .pallas_mosaic_attention import (
         MosaicAttentionConfig,
         batched_decode_attention_mosaic,
         prefill_attention_mosaic,

@@ -1,2 +1,2 @@
-from nanovllm_jax.llm import LLM
-from nanovllm_jax.sampling_params import SamplingParams
+from .llm import LLM
+from .sampling_params import SamplingParams

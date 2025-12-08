@@ -492,33 +492,34 @@ def paged_attention(
     batch_size, num_heads, head_dim = q.shape
     _, block_size_cache, num_kv_heads, _ = k_cache.shape
 
-    if MOSAIC_AVAILABLE and mosaic_attn is not None:
-        block_q = 64
-        block_kv = 64
-        can_use_mosaic = (
-            block_size_cache % block_kv == 0
-            and batch_size >= block_q  # WGMMA requires M>=64
-        )
-        if can_use_mosaic:
-            mosaic_config = mosaic_attn.MosaicAttentionConfig(
-                block_q=block_q,
-                block_kv=block_kv,
-                max_concurrent_steps=2,
-                use_schedule_barrier=True,
-                num_compute_wgs=2,
-            )
-            try:
-                return mosaic_attn.batched_decode_attention_mosaic(
-                    q=q,
-                    k_cache=k_cache,
-                    v_cache=v_cache,
-                    block_tables=block_tables,
-                    context_lens=context_lens,
-                    scale=scale,
-                    config=mosaic_config,
-                )
-            except (RuntimeError, ValueError):
-                pass
+    # TODO: Re-enable Mosaic decode once 1D iota layout issues are fully resolved.
+    # if MOSAIC_AVAILABLE and mosaic_attn is not None:
+    #     block_q = 64
+    #     block_kv = 64
+    #     can_use_mosaic = (
+    #         block_size_cache % block_kv == 0
+    #         and batch_size >= block_q  # WGMMA requires M>=64
+    #     )
+    #     if can_use_mosaic:
+    #         mosaic_config = mosaic_attn.MosaicAttentionConfig(
+    #             block_q=block_q,
+    #             block_kv=block_kv,
+    #             max_concurrent_steps=2,
+    #             use_schedule_barrier=True,
+    #             num_compute_wgs=2,
+    #         )
+    #         try:
+    #             return mosaic_attn.batched_decode_attention_mosaic(
+    #                 q=q,
+    #                 k_cache=k_cache,
+    #                 v_cache=v_cache,
+    #                 block_tables=block_tables,
+    #                 context_lens=context_lens,
+    #                 scale=scale,
+    #                 config=mosaic_config,
+    #             )
+    #         except (RuntimeError, ValueError):
+    #             pass
 
     return paged_decode_attention_vectorized(
         q, k_cache, v_cache, block_tables, context_lens, scale, block_size

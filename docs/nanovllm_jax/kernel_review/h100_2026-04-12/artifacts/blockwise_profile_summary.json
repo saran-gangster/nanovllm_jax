@@ -1,0 +1,184 @@
+{
+  "artifacts": {
+    "decode_schedule_path": "/workspace/out/initial_gpu/blockwise_profile/raw/decode_schedule.jsonl",
+    "decode_schedule_records": 31,
+    "decode_step_profile_path": "/workspace/out/initial_gpu/blockwise_profile/raw/decode_step_profile.jsonl",
+    "decode_step_records": 31,
+    "run_manifest_path": "/workspace/out/initial_gpu/blockwise_profile/run_manifest.json"
+  },
+  "counters": {
+    "kv_update_calls": 0,
+    "kv_update_duplicate_slot_pct": null,
+    "kv_update_duplicate_slots": 0,
+    "kv_update_skipped_token_pct": null,
+    "kv_update_skipped_tokens": 0,
+    "kv_update_tokens": 0,
+    "kv_update_valid_token_pct": null,
+    "kv_update_valid_tokens": 0
+  },
+  "format_version": 1,
+  "generated_at_utc": "2026-04-12T06:05:01.736643+00:00",
+  "histograms": {
+    "block_table_actions": {
+      "full_block_table_transfer": 1,
+      "reuse_block_tables": 30
+    },
+    "decode_input_actions": {
+      "full_transfer": 1,
+      "patch_active_rows": 30
+    },
+    "decode_schedule_actions": {
+      "create": 1,
+      "reuse_block_tables": 30
+    },
+    "kv_update_backends": {
+      "scatter": 31
+    },
+    "partitioned_decode_reduction_backends": {},
+    "partitioned_decode_reduction_families": {},
+    "prepared_metadata_actions": {
+      "clear_initial": 1,
+      "clear_schedule_changed": 30
+    }
+  },
+  "manifest": {
+    "env": {
+      "NANOVLLM_JAX_DIAGNOSTICS_DIR": "/workspace/out/initial_gpu/blockwise_profile/raw",
+      "NANOVLLM_JAX_DUMP_DECODE_SCHEDULE": "1",
+      "NANOVLLM_JAX_PROFILE_DECODE_STEP": "1"
+    },
+    "format_version": 1,
+    "generated_at_utc": "2026-04-12T06:05:01.726882+00:00",
+    "git": {
+      "branch": "main",
+      "dirty": true,
+      "repo_root": "/workspace/nanovllm_jax",
+      "sha": "fad17c8cc9811754ed946e5bbe53050becdfd201"
+    },
+    "invocation": {
+      "argv": [
+        "profile_decode_runtime.py",
+        "--output-dir",
+        "/workspace/out/initial_gpu/blockwise_profile",
+        "--decode-backend",
+        "blockwise",
+        "--max-tokens",
+        "32",
+        "--temperature",
+        "0.0001"
+      ],
+      "cwd": "/workspace/nanovllm_jax",
+      "entrypoint": "profile_decode_runtime.py"
+    },
+    "python": {
+      "executable": "/usr/bin/python3",
+      "version": "3.11.10"
+    },
+    "runtime": {
+      "decode_attention_backend": "blockwise",
+      "enforce_eager": false,
+      "kv_update_backend": "default",
+      "max_num_seqs": 2,
+      "mosaic_kernel_family": "default",
+      "mosaic_min_decode_batch": "default",
+      "mosaic_throughput_min_decode_batch": "default",
+      "tensor_parallel_size": 1
+    }
+  },
+  "model_path": "/workspace/models/Qwen3-0.6B",
+  "output_dir": "/workspace/out/initial_gpu/blockwise_profile",
+  "outputs": {
+    "count": 2,
+    "token_counts": [
+      32,
+      32
+    ]
+  },
+  "prompts": {
+    "count": 2,
+    "items": [
+      "Introduce yourself in one sentence.",
+      "List three properties of prime numbers."
+    ]
+  },
+  "raw_dir": "/workspace/out/initial_gpu/blockwise_profile/raw",
+  "runtime": {
+    "decode_attention_backend": "blockwise",
+    "enforce_eager": false,
+    "kv_update_backend": "default",
+    "max_num_seqs": 2,
+    "mosaic_kernel_family": "default",
+    "mosaic_min_decode_batch": "default",
+    "mosaic_throughput_min_decode_batch": "default",
+    "tensor_parallel_size": 1
+  },
+  "sampling": {
+    "max_tokens": 32,
+    "temperature": 0.0001
+  },
+  "timings": {
+    "decode_step_count": 31,
+    "model_execute_subcomponents": {
+      "kv_update_s": {
+        "max_s": null,
+        "mean_s": null,
+        "records_with_value": 0,
+        "share_of_model_execute_pct": 0.0,
+        "share_of_top_level_pct": 0.0,
+        "total_s": 0.0
+      },
+      "partitioned_decode_reduction_s": {
+        "max_s": null,
+        "mean_s": null,
+        "records_with_value": 0,
+        "share_of_model_execute_pct": 0.0,
+        "share_of_top_level_pct": 0.0,
+        "total_s": 0.0
+      }
+    },
+    "model_execute_total_s": 8.482368109980598,
+    "top_level": {
+      "model_execute_s": {
+        "max_s": 7.632804438006133,
+        "mean_s": 0.2736247777413096,
+        "records_with_value": 31,
+        "share_of_model_execute_pct": null,
+        "share_of_top_level_pct": 98.53187599698616,
+        "total_s": 8.482368109980598
+      },
+      "postprocess_s": {
+        "max_s": 2.502603456377983e-05,
+        "mean_s": 7.181405840862182e-06,
+        "records_with_value": 31,
+        "share_of_model_execute_pct": null,
+        "share_of_top_level_pct": 0.002586013575367219,
+        "total_s": 0.00022262358106672764
+      },
+      "prepare_decode_s": {
+        "max_s": 0.04153678589500487,
+        "mean_s": 0.003532655274255141,
+        "records_with_value": 31,
+        "share_of_model_execute_pct": null,
+        "share_of_top_level_pct": 1.272103916525015,
+        "total_s": 0.10951231350190938
+      },
+      "sampler_s": {
+        "max_s": 0.0007138918153941631,
+        "mean_s": 0.0005332630563287005,
+        "records_with_value": 31,
+        "share_of_model_execute_pct": null,
+        "share_of_top_level_pct": 0.1920272344254911,
+        "total_s": 0.016531154746189713
+      },
+      "scheduler_s": {
+        "max_s": 1.6451114788651466e-05,
+        "mean_s": 3.906815583186765e-06,
+        "records_with_value": 31,
+        "share_of_model_execute_pct": null,
+        "share_of_top_level_pct": 0.0014068384879588173,
+        "total_s": 0.00012111128307878971
+      }
+    },
+    "top_level_total_s": 8.608755313092843
+  }
+}

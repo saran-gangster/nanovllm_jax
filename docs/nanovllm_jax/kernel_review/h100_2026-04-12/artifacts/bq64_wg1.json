@@ -1,0 +1,76 @@
+{
+  "dtype": "bfloat16",
+  "family": "baseline",
+  "family_notes": {
+    "config": {
+      "block_kv": 64,
+      "block_q": 64,
+      "max_concurrent_steps": 2,
+      "num_compute_wgs": 1,
+      "use_schedule_barrier": true
+    },
+    "family": "baseline",
+    "metadata_prepare_s": 1.7382942920085043,
+    "metadata_shape": {
+      "tile_chunk_counts": [
+        8
+      ],
+      "tile_chunk_row_indices": [
+        8,
+        8192
+      ]
+    }
+  },
+  "format_version": 1,
+  "git": {
+    "branch": "main",
+    "dirty": true,
+    "sha": "fad17c8cc9811754ed946e5bbe53050becdfd201"
+  },
+  "iterations": {
+    "iters": 10,
+    "warmup": 5
+  },
+  "output": {
+    "checksum_f32_sum": -12585.2353515625
+  },
+  "runtime": {
+    "devices": [
+      "cuda:0"
+    ],
+    "pid": 84350,
+    "platform": "gpu",
+    "python": "3.11.10"
+  },
+  "scale": 0.08838834764831843,
+  "shape": {
+    "batch_size": 512,
+    "block_size": 256,
+    "head_dim": 128,
+    "max_blocks_per_seq": 32,
+    "num_blocks": 4096,
+    "num_heads": 16,
+    "num_kv_heads": 8
+  },
+  "timings": {
+    "compile_and_first_run_s": 0.644629729911685,
+    "iter_times_ms": [
+      132.64660211279988,
+      134.00941202417016,
+      138.96382111124694,
+      135.40881592780352,
+      138.8683640398085,
+      142.64247100800276,
+      138.05851386860013,
+      139.07666387967765,
+      134.5045929774642,
+      137.57339189760387
+    ],
+    "max_ms": 142.64247100800276,
+    "mean_ms": 137.17526488471776,
+    "min_ms": 132.64660211279988,
+    "p50_ms": 137.815952883102,
+    "warmup_mean_ms": 139.205330517143
+  },
+  "verify": null
+}

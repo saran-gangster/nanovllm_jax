@@ -1,0 +1,198 @@
+{
+  "aggregate": {
+    "counters": {
+      "kv_update_calls": 2604,
+      "kv_update_duplicate_slot_pct": 0.0,
+      "kv_update_duplicate_slots": 0,
+      "kv_update_skipped_token_pct": 0.0,
+      "kv_update_skipped_tokens": 0,
+      "kv_update_tokens": 5208,
+      "kv_update_valid_token_pct": 100.0,
+      "kv_update_valid_tokens": 5208
+    },
+    "format_version": 1,
+    "run_count": 3,
+    "runs": [
+      {
+        "decode_attention_backend": "blockwise",
+        "decode_step_count": 31,
+        "kv_update_backend": "scatter",
+        "summary_path": "/workspace/out/initial_gpu/kv_matrix_blockwise_eager/scatter/decode_runtime_profile_summary.json",
+        "top_level_total_s": 9.456258005229756
+      },
+      {
+        "decode_attention_backend": "blockwise",
+        "decode_step_count": 31,
+        "kv_update_backend": "compact_scatter",
+        "summary_path": "/workspace/out/initial_gpu/kv_matrix_blockwise_eager/compact_scatter/decode_runtime_profile_summary.json",
+        "top_level_total_s": 4.488672786159441
+      },
+      {
+        "decode_attention_backend": "blockwise",
+        "decode_step_count": 31,
+        "kv_update_backend": "sorted_compact_scatter",
+        "summary_path": "/workspace/out/initial_gpu/kv_matrix_blockwise_eager/sorted_compact_scatter/decode_runtime_profile_summary.json",
+        "top_level_total_s": 4.60694742272608
+      }
+    ],
+    "summary_paths": [
+      "/workspace/out/initial_gpu/kv_matrix_blockwise_eager/scatter/decode_runtime_profile_summary.json",
+      "/workspace/out/initial_gpu/kv_matrix_blockwise_eager/compact_scatter/decode_runtime_profile_summary.json",
+      "/workspace/out/initial_gpu/kv_matrix_blockwise_eager/sorted_compact_scatter/decode_runtime_profile_summary.json"
+    ],
+    "timings": {
+      "decode_step_count": 93,
+      "model_execute_subcomponents": {
+        "kv_update_s": {
+          "max_s": 0.2464714478701353,
+          "mean_s": 0.01024125480864157,
+          "records_with_value": 93,
+          "share_of_model_execute_pct": 5.217450175509104,
+          "share_of_top_level_pct": 5.133909818785897,
+          "total_s": 0.952436697203666
+        },
+        "partitioned_decode_reduction_s": {
+          "max_s": null,
+          "mean_s": null,
+          "records_with_value": 0,
+          "share_of_model_execute_pct": 0.0,
+          "share_of_top_level_pct": 0.0,
+          "total_s": 0.0
+        }
+      },
+      "model_execute_total_s": 18.25483071547933,
+      "top_level": {
+        "model_execute_s": {
+          "max_s": 5.437794619007036,
+          "mean_s": 0.19628850231698203,
+          "records_with_value": 93,
+          "share_of_model_execute_pct": null,
+          "share_of_top_level_pct": 98.39882789652027,
+          "total_s": 18.25483071547933
+        },
+        "postprocess_s": {
+          "max_s": 3.303308039903641e-05,
+          "mean_s": 7.001224965337784e-06,
+          "records_with_value": 93,
+          "share_of_model_execute_pct": null,
+          "share_of_top_level_pct": 0.003509692734404709,
+          "total_s": 0.0006511139217764139
+        },
+        "prepare_decode_s": {
+          "max_s": 0.040844384115189314,
+          "mean_s": 0.002679005941195834,
+          "records_with_value": 93,
+          "share_of_model_execute_pct": null,
+          "share_of_top_level_pct": 1.3429775123342906,
+          "total_s": 0.24914755253121257
+        },
+        "sampler_s": {
+          "max_s": 0.0006755860522389412,
+          "mean_s": 0.000504379879222602,
+          "records_with_value": 93,
+          "share_of_model_execute_pct": null,
+          "share_of_top_level_pct": 0.2528440960334266,
+          "total_s": 0.04690732876770198
+        },
+        "scheduler_s": {
+          "max_s": 1.309812068939209e-05,
+          "mean_s": 3.6720797339434266e-06,
+          "records_with_value": 93,
+          "share_of_model_execute_pct": null,
+          "share_of_top_level_pct": 0.0018408023776099623,
+          "total_s": 0.00034150341525673866
+        }
+      },
+      "top_level_total_s": 18.551878214115277
+    }
+  },
+  "backend_order": [
+    "scatter",
+    "compact_scatter",
+    "sorted_compact_scatter"
+  ],
+  "baseline_backend": "scatter",
+  "comparisons_vs_baseline": {
+    "compact_scatter": {
+      "comparison_path": "/workspace/out/initial_gpu/kv_matrix_blockwise_eager/compare_scatter_vs_compact_scatter.json",
+      "kv_update_duplicate_slots_delta": 0.0,
+      "kv_update_share_of_model_execute_pct_delta": 4.731415166103135,
+      "kv_update_total_s_delta": 0.09273828938603401,
+      "kv_update_valid_tokens_delta": 0.0
+    },
+    "sorted_compact_scatter": {
+      "comparison_path": "/workspace/out/initial_gpu/kv_matrix_blockwise_eager/compare_scatter_vs_sorted_compact_scatter.json",
+      "kv_update_duplicate_slots_delta": 0.0,
+      "kv_update_share_of_model_execute_pct_delta": 6.983222230856068,
+      "kv_update_total_s_delta": 0.20287636597640812,
+      "kv_update_valid_tokens_delta": 0.0
+    }
+  },
+  "format_version": 1,
+  "generated_at_utc": "2026-04-12T06:10:18.526211+00:00",
+  "model_path": "/workspace/models/Qwen3-0.6B",
+  "output_dir": "/workspace/out/initial_gpu/kv_matrix_blockwise_eager",
+  "runs": [
+    {
+      "backend": "scatter",
+      "counters": {
+        "kv_update_calls": 868,
+        "kv_update_duplicate_slot_pct": 0.0,
+        "kv_update_duplicate_slots": 0,
+        "kv_update_skipped_token_pct": 0.0,
+        "kv_update_skipped_tokens": 0,
+        "kv_update_tokens": 1736,
+        "kv_update_valid_token_pct": 100.0,
+        "kv_update_valid_tokens": 1736
+      },
+      "decode_step_count": 31,
+      "kv_update_share_of_model_execute_pct": 2.3465885679936167,
+      "kv_update_total_s": 0.21894068061374128,
+      "output_dir": "/workspace/out/initial_gpu/kv_matrix_blockwise_eager/scatter",
+      "summary_path": "/workspace/out/initial_gpu/kv_matrix_blockwise_eager/scatter/decode_runtime_profile_summary.json"
+    },
+    {
+      "backend": "compact_scatter",
+      "counters": {
+        "kv_update_calls": 868,
+        "kv_update_duplicate_slot_pct": 0.0,
+        "kv_update_duplicate_slots": 0,
+        "kv_update_skipped_token_pct": 0.0,
+        "kv_update_skipped_tokens": 0,
+        "kv_update_tokens": 1736,
+        "kv_update_valid_token_pct": 100.0,
+        "kv_update_valid_tokens": 1736
+      },
+      "decode_step_count": 31,
+      "kv_update_share_of_model_execute_pct": 7.078003734096751,
+      "kv_update_total_s": 0.3116789699997753,
+      "output_dir": "/workspace/out/initial_gpu/kv_matrix_blockwise_eager/compact_scatter",
+      "summary_path": "/workspace/out/initial_gpu/kv_matrix_blockwise_eager/compact_scatter/decode_runtime_profile_summary.json"
+    },
+    {
+      "backend": "sorted_compact_scatter",
+      "counters": {
+        "kv_update_calls": 868,
+        "kv_update_duplicate_slot_pct": 0.0,
+        "kv_update_duplicate_slots": 0,
+        "kv_update_skipped_token_pct": 0.0,
+        "kv_update_skipped_tokens": 0,
+        "kv_update_tokens": 1736,
+        "kv_update_valid_token_pct": 100.0,
+        "kv_update_valid_tokens": 1736
+      },
+      "decode_step_count": 31,
+      "kv_update_share_of_model_execute_pct": 9.329810798849685,
+      "kv_update_total_s": 0.4218170465901494,
+      "output_dir": "/workspace/out/initial_gpu/kv_matrix_blockwise_eager/sorted_compact_scatter",
+      "summary_path": "/workspace/out/initial_gpu/kv_matrix_blockwise_eager/sorted_compact_scatter/decode_runtime_profile_summary.json"
+    }
+  ],
+  "runtime": {
+    "decode_attention_backend": "blockwise",
+    "enforce_eager": true,
+    "mosaic_kernel_family": "default",
+    "mosaic_min_decode_batch": "default",
+    "mosaic_throughput_min_decode_batch": "default"
+  }
+}

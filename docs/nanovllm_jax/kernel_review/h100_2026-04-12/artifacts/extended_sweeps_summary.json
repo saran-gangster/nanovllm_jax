@@ -1,0 +1,178 @@
+[
+  {
+    "sweep": "same_shape",
+    "batch": 4096,
+    "max_blocks_per_seq": 16,
+    "head_dim": 128,
+    "family": "blockwise",
+    "mean_ms": 72.15251667657867,
+    "p50_ms": 72.14538741391152,
+    "min_ms": 72.13374297134578,
+    "compile_s": 1.537678865948692
+  },
+  {
+    "sweep": "same_shape",
+    "batch": 4096,
+    "max_blocks_per_seq": 16,
+    "head_dim": 128,
+    "family": "baseline",
+    "mean_ms": 172.4214239511639,
+    "p50_ms": 172.93511691968888,
+    "min_ms": 163.2908401079476,
+    "compile_s": 0.6747209839522839
+  },
+  {
+    "sweep": "same_shape",
+    "batch": 4096,
+    "max_blocks_per_seq": 16,
+    "head_dim": 128,
+    "family": "latency",
+    "mean_ms": 181.76847357535735,
+    "p50_ms": 178.5371374571696,
+    "min_ms": 171.79793189279735,
+    "compile_s": 3.0549422218464315
+  },
+  {
+    "sweep": "same_shape",
+    "batch": 4096,
+    "max_blocks_per_seq": 16,
+    "head_dim": 128,
+    "family": "throughput",
+    "mean_ms": 185.39447472430766,
+    "p50_ms": 180.11329101864249,
+    "min_ms": 174.3586400989443,
+    "compile_s": 3.0511534730903804
+  },
+  {
+    "sweep": "long_context",
+    "batch": 512,
+    "max_blocks_per_seq": 32,
+    "head_dim": 128,
+    "family": "blockwise",
+    "mean_ms": 18.645676621235907,
+    "p50_ms": 18.644034978933632,
+    "min_ms": 18.634250853210688,
+    "compile_s": 1.1648004387971014
+  },
+  {
+    "sweep": "long_context",
+    "batch": 512,
+    "max_blocks_per_seq": 32,
+    "head_dim": 128,
+    "family": "baseline",
+    "mean_ms": 133.83814634289593,
+    "p50_ms": 133.94518243148923,
+    "min_ms": 129.26363199949265,
+    "compile_s": 0.6538048130460083
+  },
+  {
+    "sweep": "long_context",
+    "batch": 512,
+    "max_blocks_per_seq": 32,
+    "head_dim": 128,
+    "family": "latency",
+    "mean_ms": 156.14943689433858,
+    "p50_ms": 153.44988042488694,
+    "min_ms": 148.78330193459988,
+    "compile_s": 3.1088351130019873
+  },
+  {
+    "sweep": "long_context",
+    "batch": 512,
+    "max_blocks_per_seq": 32,
+    "head_dim": 128,
+    "family": "throughput",
+    "mean_ms": 155.15375022077933,
+    "p50_ms": 151.87537006568164,
+    "min_ms": 144.7119959630072,
+    "compile_s": 3.042159980162978
+  },
+  {
+    "sweep": "long_context",
+    "batch": 512,
+    "max_blocks_per_seq": 64,
+    "head_dim": 128,
+    "family": "blockwise",
+    "mean_ms": 37.100620195269585,
+    "p50_ms": 37.098804488778114,
+    "min_ms": 37.08039992488921,
+    "compile_s": 1.1288736038841307
+  },
+  {
+    "sweep": "long_context",
+    "batch": 512,
+    "max_blocks_per_seq": 64,
+    "head_dim": 128,
+    "family": "baseline",
+    "mean_ms": 147.412264382001,
+    "p50_ms": 146.9647054327652,
+    "min_ms": 140.81832487136126,
+    "compile_s": 0.7513843039050698
+  },
+  {
+    "sweep": "long_context",
+    "batch": 512,
+    "max_blocks_per_seq": 64,
+    "head_dim": 128,
+    "family": "latency",
+    "mean_ms": 169.87901362590492,
+    "p50_ms": 166.60498443525285,
+    "min_ms": 163.27337408438325,
+    "compile_s": 3.3135875680018216
+  },
+  {
+    "sweep": "long_context",
+    "batch": 512,
+    "max_blocks_per_seq": 64,
+    "head_dim": 128,
+    "family": "throughput",
+    "mean_ms": 150.3226316999644,
+    "p50_ms": 151.28229896072298,
+    "min_ms": 141.66239090263844,
+    "compile_s": 2.4758511539548635
+  },
+  {
+    "sweep": "head_dim",
+    "batch": 512,
+    "max_blocks_per_seq": 16,
+    "head_dim": 64,
+    "family": "blockwise",
+    "mean_ms": 5.335320020094514,
+    "p50_ms": 5.165792535990477,
+    "min_ms": 5.148664116859436,
+    "compile_s": 1.0297463780734688
+  },
+  {
+    "sweep": "head_dim",
+    "batch": 512,
+    "max_blocks_per_seq": 16,
+    "head_dim": 64,
+    "family": "baseline",
+    "mean_ms": 123.617793538142,
+    "p50_ms": 122.75277799926698,
+    "min_ms": 114.79821684770286,
+    "compile_s": 0.5208464730530977
+  },
+  {
+    "sweep": "head_dim",
+    "batch": 512,
+    "max_blocks_per_seq": 16,
+    "head_dim": 64,
+    "family": "latency",
+    "mean_ms": 130.07650304352865,
+    "p50_ms": 129.3761064298451,
+    "min_ms": 124.00852306745946,
+    "compile_s": 2.220908239018172
+  },
+  {
+    "sweep": "head_dim",
+    "batch": 512,
+    "max_blocks_per_seq": 16,
+    "head_dim": 64,
+    "family": "throughput",
+    "mean_ms": 133.64937733858824,
+    "p50_ms": 133.36761808022857,
+    "min_ms": 129.34771296568215,
+    "compile_s": 2.3875221661292017
+  }
+]

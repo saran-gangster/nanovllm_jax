@@ -11,6 +11,7 @@ Kernel families in this module:
 - baseline: stable batched decode core
 - latency: short-context partitioned decode path
 - throughput: long-context split-k decode path
+- throughput_v2: row-native partitioned decode partials + device reduction
 
 Key algorithms:
 - online softmax with log2/exp2 for FMA utilization
@@ -90,7 +91,7 @@ class MosaicAttentionConfig:
         block_kv: KV block size for tiling (must be multiple of 64).
         max_concurrent_steps: Pipeline depth (2-4 typically).
         use_schedule_barrier: Enable TensorCore coordination barriers.
-        num_compute_wgs: Number of compute warpgroups (typically 2).
+        num_compute_wgs: Number of compute warpgroups (typically 1-2).
     """
     block_q: int = 64       # Query tile size (M dimension for WGMMA)
     block_kv: int = 64      # KV tile size
@@ -109,24 +110,37 @@ class MosaicAttentionConfig:
 
 @dataclasses.dataclass(frozen=True)
 class ThroughputV2Plan:
-    """Planned long-context throughput-v2 execution metadata.
+    """Schedule-owned throughput-v2 execution plan.
 
-    This is intentionally small and JSON-friendly so the bench path can report
-    what a future bridge-free implementation intends to optimize without
-    changing the active runtime yet.
+    The plan is intentionally small so it can live in the per-family decode
+    schedule cache without inheriting the old flattened tile-chunk metadata
+    model.
     """
 
     batch_size: int
     num_heads: int
+    num_kv_heads: int
     head_dim: int
     max_blocks_per_seq: int
     block_size: int
-    block_q: int
     block_kv: int
+    q_heads_per_kv_head: int
     k_splits: int
     pages_per_partition: int
+    max_concurrent_steps: int
+    num_compute_wgs: int
+    use_schedule_barrier: bool
+    partial_kernel: str
+    launch_block_q: int | None
+    launch_max_concurrent_steps: int | None
+    launch_num_compute_wgs: int | None
+    launch_num_memory_wgs: int | None
+    launch_use_schedule_barrier: bool | None
     uses_wrapper_partitioning: bool
+    uses_batched_core: bool
     reduction_boundary: str
+    reduction_backend: str
+    metadata_model: str
     metadata_cache_key: tuple[object, ...]
 
 
@@ -176,11 +190,11 @@ def _get_or_prepare_cached_metadata(
 
 def _normalize_partitioned_decode_reduction_backend(raw: str) -> str:
     backend = str(raw).strip().lower()
-    if backend in {"auto", "streaming"}:
+    if backend in {"auto", "streaming", "device"}:
         return backend
     raise ValueError(
         "NANOVLLM_JAX_PARTITIONED_DECODE_REDUCTION_BACKEND must be one of: "
-        "auto|streaming"
+        "auto|streaming|device"
     )
 
 
@@ -1416,13 +1430,18 @@ def _merge_split_partials_streaming(
     if acc_partial.shape[1] == 1:
         acc0 = acc_partial[:, 0, :, :].astype(jnp.float32)
         l0 = l_partial[:, 0, :].astype(jnp.float32)
-        return acc0 / jnp.maximum(l0[..., None], eps)
+        valid0 = l0 > 0
+        out0 = acc0 / jnp.maximum(l0[..., None], eps)
+        return jnp.where(valid0[..., None], out0, 0.0)
 
     # Initialize recurrence from split 0 to avoid one scan step and redundant
     # float32 casts inside the body.
     init_acc = acc_partial[:, 0, :, :].astype(jnp.float32)
     init_l = l_partial[:, 0, :].astype(jnp.float32)
     init_m = m_partial[:, 0, :].astype(jnp.float32)
+    init_valid = init_l > 0
+    init_acc = init_acc * init_valid[..., None].astype(jnp.float32)
+    init_m = jnp.where(init_valid, init_m, -jnp.inf)
 
     acc_final = init_acc
     l_final = init_l
@@ -1430,15 +1449,19 @@ def _merge_split_partials_streaming(
     # Split count is static in compiled decode paths; unroll to avoid a
     # runtime while/scan in lowered IR.
     for split_idx in range(1, int(acc_partial.shape[1])):
-        acc_s = acc_partial[:, split_idx, :, :]
-        l_s = l_partial[:, split_idx, :]
-        m_s = m_partial[:, split_idx, :]
-        m_next = jnp.maximum(m_final, m_s)
-        alpha = jnp.exp2(m_final - m_next)
-        beta = jnp.exp2(m_s - m_next)
+        acc_s = acc_partial[:, split_idx, :, :].astype(jnp.float32)
+        l_s = l_partial[:, split_idx, :].astype(jnp.float32)
+        m_s = m_partial[:, split_idx, :].astype(jnp.float32)
+        final_valid = l_final > 0
+        split_valid = l_s > 0
+        m_final_safe = jnp.where(final_valid, m_final, -jnp.inf)
+        m_s_safe = jnp.where(split_valid, m_s, -jnp.inf)
+        m_next = jnp.maximum(m_final_safe, m_s_safe)
+        alpha = jnp.where(final_valid, jnp.exp2(m_final_safe - m_next), 0.0)
+        beta = jnp.where(split_valid, jnp.exp2(m_s_safe - m_next), 0.0)
         acc_final = acc_final * alpha[..., None] + acc_s * beta[..., None]
         l_final = l_final * alpha + l_s * beta
-        m_final = m_next
+        m_final = jnp.where(final_valid | split_valid, m_next, m_final)
 
     return acc_final / jnp.maximum(l_final[..., None], eps)
 
@@ -1452,6 +1475,25 @@ def _merge_split_partials(
     eps: float = 1e-9,
 ) -> jax.Array:
     """Compatibility wrapper for the current streaming reduction implementation."""
+    return _merge_split_partials_streaming(
+        acc_partial,
+        l_partial,
+        m_partial,
+        axis=axis,
+        eps=eps,
+    )
+
+
+@partial(jax.jit, static_argnames=("axis", "eps"))
+def _merge_split_partials_device(
+    acc_partial: jax.Array,
+    l_partial: jax.Array,
+    m_partial: jax.Array,
+    *,
+    axis: int,
+    eps: float = 1e-9,
+) -> jax.Array:
+    """Compile the streaming recurrence into a device-side reduction boundary."""
     return _merge_split_partials_streaming(
         acc_partial,
         l_partial,
@@ -1480,6 +1522,13 @@ def reduce_partitioned_decode_partials(
 
     if backend == "streaming":
         out = _merge_split_partials_streaming(
+            acc_partial,
+            l_partial,
+            m_partial,
+            axis=axis,
+        )
+    elif backend == "device":
+        out = _merge_split_partials_device(
             acc_partial,
             l_partial,
             m_partial,
@@ -1601,6 +1650,56 @@ def _resolve_latency_config(block_size: int, config: MosaicAttentionConfig | Non
         max_concurrent_steps=config.max_concurrent_steps,
         use_schedule_barrier=config.use_schedule_barrier,
         num_compute_wgs=config.num_compute_wgs,
+    )
+
+
+def _resolve_throughput_v2_config(
+    block_size: int,
+    config: MosaicAttentionConfig | None,
+) -> MosaicAttentionConfig:
+    """Normalize throughput-v2 to the expert-guided v1 defaults.
+
+    Throughput-v2 is row-native and does not depend on the old batched decode
+    core's multi-WG + schedule-barrier defaults. The current v1 path only
+    supports the expert-guided execution envelope:
+    block_q=64, 1 compute WG, 2 stages, no schedule barrier.
+    Caller-provided configs may still tighten block_kv, but the unsupported
+    launch topology fields are normalized to the current implementation.
+    """
+    if config is None:
+        return MosaicAttentionConfig(
+            block_q=64,
+            block_kv=64 if block_size % 64 == 0 else block_size,
+            max_concurrent_steps=2,
+            use_schedule_barrier=False,
+            num_compute_wgs=1,
+        )
+
+    block_kv = min(config.block_kv, block_size)
+    block_kv = max(64, (block_kv // 64) * 64)
+    while block_kv > 64 and (block_size % block_kv != 0):
+        block_kv -= 64
+    if block_size % block_kv != 0:
+        block_kv = 64
+    if block_size % block_kv != 0:
+        raise ValueError(
+            "throughput_v2 config requires block_size divisible by block_kv: "
+            f"block_size={block_size}, resolved_block_kv={block_kv}"
+        )
+    return MosaicAttentionConfig(
+        block_q=64,
+        block_kv=block_kv,
+        max_concurrent_steps=2,
+        use_schedule_barrier=False,
+        num_compute_wgs=1,
+    )
+
+
+def _should_use_throughput_v2_mosaic_kernel() -> bool:
+    return (
+        MOSAIC_AVAILABLE
+        and jax.default_backend() == "gpu"
+        and os.environ.get("NANOVLLM_JAX_ENABLE_THROUGHPUT_V2_MOSAIC", "").strip() == "1"
     )
 
 
@@ -1921,20 +2020,20 @@ def build_paged_decode_throughput_v2_plan(
     block_tables: jax.Array,
     context_lens: jax.Array,
     block_size: int,
+    num_kv_heads: int | None = None,
     config: MosaicAttentionConfig | None = None,
     split_k: int = 0,
 ) -> ThroughputV2Plan:
-    """Build the non-active throughput-v2 execution plan.
-
-    The current implementation is a scaffolding seam only. It records the shape
-    and partitioning decisions that a future bridge-free throughput kernel
-    should own internally rather than via wrapper-side q broadcast and JAX-side
-    merge logic.
-    """
+    """Build the tiny schedule-owned plan for the bridge-free throughput_v2 path."""
     del context_lens
     batch_size, num_heads, head_dim = q.shape
+    num_kv_heads = int(num_kv_heads or num_heads)
+    if num_heads % num_kv_heads != 0:
+        raise ValueError(
+            f"num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+        )
     max_blocks_per_seq = block_tables.shape[1]
-    kernel_config = _resolve_latency_config(block_size, config)
+    kernel_config = _resolve_throughput_v2_config(block_size, config)
     k_splits = _select_throughput_k_splits(
         split_k=split_k,
         batch_size=batch_size,
@@ -1948,27 +2047,558 @@ def build_paged_decode_throughput_v2_plan(
     pages_per_partition = (
         (max_blocks_per_seq + k_splits - 1) // k_splits if k_splits > 0 else 0
     )
+    q_heads_per_kv_head = num_heads // num_kv_heads
+    if _should_use_throughput_v2_mosaic_kernel():
+        partial_kernel = "row_partition_mosaic_v1"
+        launch_block_q = 64
+        launch_max_concurrent_steps = 2
+        launch_num_compute_wgs = 1
+        launch_num_memory_wgs = 1
+        launch_use_schedule_barrier = False
+    else:
+        partial_kernel = "row_partition_jax_v1"
+        launch_block_q = None
+        launch_max_concurrent_steps = None
+        launch_num_compute_wgs = None
+        launch_num_memory_wgs = None
+        launch_use_schedule_barrier = None
     return ThroughputV2Plan(
         batch_size=batch_size,
         num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         max_blocks_per_seq=max_blocks_per_seq,
         block_size=block_size,
-        block_q=kernel_config.block_q,
         block_kv=kernel_config.block_kv,
+        q_heads_per_kv_head=q_heads_per_kv_head,
         k_splits=k_splits,
         pages_per_partition=pages_per_partition,
+        max_concurrent_steps=kernel_config.max_concurrent_steps,
+        num_compute_wgs=kernel_config.num_compute_wgs,
+        use_schedule_barrier=kernel_config.use_schedule_barrier,
+        partial_kernel=partial_kernel,
+        launch_block_q=launch_block_q,
+        launch_max_concurrent_steps=launch_max_concurrent_steps,
+        launch_num_compute_wgs=launch_num_compute_wgs,
+        launch_num_memory_wgs=launch_num_memory_wgs,
+        launch_use_schedule_barrier=launch_use_schedule_barrier,
         uses_wrapper_partitioning=False,
-        reduction_boundary="jax_merge_v1_fallback",
+        uses_batched_core=False,
+        reduction_boundary="device_split_reduction_v1",
+        reduction_backend="device",
+        metadata_model="schedule_plan_v1",
         metadata_cache_key=(
             "throughput_v2",
             batch_size,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            max_blocks_per_seq,
+            block_size,
+            kernel_config.block_kv,
+            q_heads_per_kv_head,
             k_splits,
             pages_per_partition,
-            kernel_config.block_q,
-            kernel_config.block_kv,
-            block_size,
+            kernel_config.max_concurrent_steps,
+            kernel_config.num_compute_wgs,
+            kernel_config.use_schedule_barrier,
+            partial_kernel,
+            "device_split_reduction_v1",
+            "schedule_plan_v1",
         ),
+    )
+
+
+def _throughput_v2_compute_partition_partials(
+    *,
+    q_grouped: jax.Array,
+    k_cache: jax.Array,
+    v_cache: jax.Array,
+    block_tables: jax.Array,
+    context_lens: jax.Array,
+    scale: float,
+    plan: ThroughputV2Plan,
+    split_idx: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Compute row-native partials for one `(row, kv_head_group, partition)` view."""
+    batch_size, num_kv_heads, q_heads_per_kv_head, head_dim = q_grouped.shape
+    num_blocks = k_cache.shape[0]
+    chunks_per_block = plan.block_size // plan.block_kv
+    start_page = split_idx * plan.pages_per_partition
+    start_token = start_page * plan.block_size
+    max_partition_tokens = plan.pages_per_partition * plan.block_size
+    split_context_lens = jnp.clip(
+        context_lens.astype(jnp.int32) - jnp.int32(start_token),
+        min=0,
+        max=max_partition_tokens,
+    ).astype(jnp.int32)
+
+    acc = jnp.zeros(
+        (batch_size, num_kv_heads, q_heads_per_kv_head, head_dim),
+        dtype=jnp.float32,
+    )
+    l = jnp.zeros(
+        (batch_size, num_kv_heads, q_heads_per_kv_head),
+        dtype=jnp.float32,
+    )
+    m = jnp.full_like(l, -jnp.inf)
+    log2e = jnp.float32(math.log2(math.e))
+    token_positions = jnp.arange(plan.block_kv, dtype=jnp.int32)[None, None, None, :]
+
+    for local_page_idx in range(plan.pages_per_partition):
+        global_page_idx = start_page + local_page_idx
+        if global_page_idx >= plan.max_blocks_per_seq:
+            break
+
+        phys = jnp.clip(block_tables[:, global_page_idx], min=0, max=num_blocks - 1)
+        k_page = k_cache[phys]
+        v_page = v_cache[phys]
+        k_page = jnp.transpose(k_page, (0, 2, 1, 3)).astype(jnp.float32)
+        v_page = jnp.transpose(v_page, (0, 2, 1, 3)).astype(jnp.float32)
+        page_context_lens = jnp.clip(
+            split_context_lens - jnp.int32(local_page_idx * plan.block_size),
+            min=0,
+            max=plan.block_size,
+        ).astype(jnp.int32)
+
+        for chunk_idx in range(chunks_per_block):
+            chunk_start = chunk_idx * plan.block_kv
+            valid_tokens = jnp.clip(
+                page_context_lens - jnp.int32(chunk_start),
+                min=0,
+                max=plan.block_kv,
+            ).astype(jnp.int32)
+            k_chunk = lax.dynamic_slice_in_dim(
+                k_page,
+                start_index=chunk_start,
+                slice_size=plan.block_kv,
+                axis=2,
+            )
+            v_chunk = lax.dynamic_slice_in_dim(
+                v_page,
+                start_index=chunk_start,
+                slice_size=plan.block_kv,
+                axis=2,
+            )
+            logits = jnp.einsum(
+                "bgqd,bgkd->bgqk",
+                q_grouped,
+                k_chunk,
+                preferred_element_type=jnp.float32,
+            ) * scale
+            mask = token_positions < valid_tokens[:, None, None, None]
+            logits = jnp.where(mask, logits, -jnp.inf)
+
+            current_valid = l > 0
+            chunk_valid = valid_tokens[:, None, None] > 0
+            m_safe = jnp.where(current_valid, m, -jnp.inf)
+            m_curr = jnp.max(logits, axis=-1)
+            m_curr_safe = jnp.where(chunk_valid, m_curr, -jnp.inf)
+            m_next = jnp.maximum(m_safe, m_curr_safe)
+            any_valid = current_valid | chunk_valid
+            corr = jnp.where(current_valid, jnp.exp2((m_safe - m_next) * log2e), 0.0)
+            m_next_for_exp = jnp.where(any_valid, m_next, 0.0)
+            logits_safe = jnp.where(mask, logits, m_next_for_exp[..., None])
+            p = jnp.exp2((logits_safe - m_next_for_exp[..., None]) * log2e)
+            p = jnp.where(mask, p, 0.0)
+            l = l * corr + p.sum(axis=-1)
+            acc = acc * corr[..., None] + jnp.einsum(
+                "bgqk,bgkd->bgqd",
+                p,
+                v_chunk,
+                preferred_element_type=jnp.float32,
+            )
+            m = jnp.where(any_valid, m_next, m)
+
+    return acc, l, m
+
+
+def _compute_throughput_v2_partials_jax(
+    *,
+    q: jax.Array,
+    k_cache: jax.Array,
+    v_cache: jax.Array,
+    block_tables: jax.Array,
+    context_lens: jax.Array,
+    scale: float,
+    plan: ThroughputV2Plan,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """JAX fallback for throughput_v2 partials."""
+    q_grouped = q.reshape(
+        plan.batch_size,
+        plan.num_kv_heads,
+        plan.q_heads_per_kv_head,
+        plan.head_dim,
+    )
+    acc_partials = []
+    l_partials = []
+    m_partials = []
+    for split_idx in range(plan.k_splits):
+        acc_s, l_s, m_s = _throughput_v2_compute_partition_partials(
+            q_grouped=q_grouped,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_tables=block_tables,
+            context_lens=context_lens,
+            scale=scale,
+            plan=plan,
+            split_idx=split_idx,
+        )
+        acc_partials.append(acc_s)
+        l_partials.append(l_s)
+        m_partials.append(m_s)
+
+    acc_grouped = jnp.stack(acc_partials, axis=1)
+    l_grouped = jnp.stack(l_partials, axis=1)
+    m_grouped = jnp.stack(m_partials, axis=1)
+    acc_partial = acc_grouped.reshape(
+        plan.batch_size,
+        plan.k_splits,
+        plan.num_heads,
+        plan.head_dim,
+    )
+    l_partial = l_grouped.reshape(plan.batch_size, plan.k_splits, plan.num_heads)
+    m_partial = m_grouped.reshape(plan.batch_size, plan.k_splits, plan.num_heads)
+    return acc_partial, l_partial, m_partial
+
+
+def _compute_throughput_v2_partials_mosaic(
+    *,
+    q: jax.Array,
+    k_cache: jax.Array,
+    v_cache: jax.Array,
+    block_tables: jax.Array,
+    context_lens: jax.Array,
+    scale: float,
+    plan: ThroughputV2Plan,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Row-native throughput_v2 partials kernel backed by Pallas Mosaic GPU."""
+    _check_mosaic_available()
+    padded_block_q = 64
+    if plan.q_heads_per_kv_head > padded_block_q:
+        raise NotImplementedError(
+            "throughput_v2 mosaic partials currently support at most 64 query heads per KV head group"
+        )
+
+    q_grouped = q.reshape(
+        plan.batch_size,
+        plan.num_kv_heads,
+        plan.q_heads_per_kv_head,
+        plan.head_dim,
+    )
+    q_grouped_padded = jnp.pad(
+        q_grouped,
+        ((0, 0), (0, 0), (0, padded_block_q - plan.q_heads_per_kv_head), (0, 0)),
+    )
+    num_blocks = k_cache.shape[0]
+    chunks_per_block = plan.block_size // plan.block_kv
+    max_partition_tokens = plan.pages_per_partition * plan.block_size
+    k_cache_flat = k_cache.reshape(num_blocks * plan.block_size, plan.num_kv_heads, plan.head_dim)
+    v_cache_flat = v_cache.reshape(num_blocks * plan.block_size, plan.num_kv_heads, plan.head_dim)
+    scale_arr = jnp.asarray(scale, dtype=jnp.float32)
+    transforms = get_smem_transforms(plan.head_dim, q.dtype)
+    compiler_params = _decode_compiler_params(throughput_mode=True)
+
+    def kernel_entry(
+        q_ref,
+        k_cache_flat_ref,
+        v_cache_flat_ref,
+        block_tables_ref,
+        context_lens_ref,
+        scale_ref,
+        acc_ref,
+        l_ref,
+        m_ref,
+        q_smem,
+        k_smem,
+        v_smem,
+        q_barrier,
+        k_barrier,
+        v_barrier,
+        k_consumed,
+        v_consumed,
+    ):
+        batch_idx = lax.axis_index("batch")
+        kv_head_idx = lax.axis_index("kv_heads")
+        split_idx = lax.axis_index("splits")
+        wg_idx = lax.axis_index("wg")
+
+        split_start_page = split_idx * plan.pages_per_partition
+        split_start_token = split_start_page * plan.block_size
+        split_context_len = jnp.clip(
+            context_lens_ref[batch_idx].astype(jnp.int32) - jnp.int32(split_start_token),
+            min=0,
+            max=max_partition_tokens,
+        ).astype(jnp.int32)
+
+        @pl.when(wg_idx == 1)
+        def _memory_wg():
+            plgpu.set_max_registers(40, action="decrease")
+            plgpu.copy_gmem_to_smem(
+                q_ref.at[batch_idx, kv_head_idx],
+                q_smem,
+                q_barrier,
+            )
+
+            first_chunk = True
+            for local_page_idx in range(plan.pages_per_partition):
+                global_page_idx = split_start_page + local_page_idx
+                safe_page_idx = jnp.minimum(
+                    global_page_idx,
+                    jnp.int32(plan.max_blocks_per_seq - 1),
+                )
+                physical_block = jnp.clip(
+                    block_tables_ref[batch_idx, safe_page_idx],
+                    min=0,
+                    max=num_blocks - 1,
+                )
+
+                for chunk_idx in range(chunks_per_block):
+                    if not first_chunk:
+                        plgpu.barrier_wait(k_consumed)
+                        plgpu.barrier_wait(v_consumed)
+                    first_chunk = False
+                    chunk_base = physical_block * plan.block_size + chunk_idx * plan.block_kv
+                    plgpu.copy_gmem_to_smem(
+                        k_cache_flat_ref.at[
+                            pl.ds(chunk_base, plan.block_kv),
+                            kv_head_idx,
+                        ],
+                        k_smem,
+                        k_barrier,
+                    )
+                    plgpu.copy_gmem_to_smem(
+                        v_cache_flat_ref.at[
+                            pl.ds(chunk_base, plan.block_kv),
+                            kv_head_idx,
+                        ],
+                        v_smem,
+                        v_barrier,
+                    )
+
+        @pl.when(wg_idx == 0)
+        def _compute_wg():
+            plgpu.set_max_registers(232, action="increase")
+            scale_value = scale_ref[...].astype(jnp.float32)
+            plgpu.barrier_wait(q_barrier)
+
+            m_i = plgpu.layout_cast(
+                jnp.full((padded_block_q,), -jnp.inf, dtype=jnp.float32),
+                _WGMMA_ROW,
+            )
+            l_i = plgpu.layout_cast(
+                jnp.zeros((padded_block_q,), dtype=jnp.float32),
+                _WGMMA_ROW,
+            )
+            acc = plgpu.layout_cast(
+                jnp.zeros((padded_block_q, plan.head_dim), dtype=jnp.float32),
+                plgpu.Layout.WGMMA,
+            )
+            row_ids_2d = plgpu.layout_cast(
+                plgpu.broadcasted_iota(
+                    jnp.int32,
+                    (padded_block_q, plan.block_kv),
+                    0,
+                    layout=plgpu.Layout.WGMMA,
+                ),
+                plgpu.Layout.WGMMA,
+            )
+            col_ids_2d = plgpu.layout_cast(
+                plgpu.broadcasted_iota(
+                    jnp.int32,
+                    (padded_block_q, plan.block_kv),
+                    1,
+                    layout=plgpu.Layout.WGMMA,
+                ),
+                plgpu.Layout.WGMMA,
+            )
+            log2e = math.log2(math.e)
+
+            for local_page_idx in range(plan.pages_per_partition):
+                page_context_len = jnp.clip(
+                    split_context_len - jnp.int32(local_page_idx * plan.block_size),
+                    min=0,
+                    max=plan.block_size,
+                ).astype(jnp.int32)
+
+                for chunk_idx in range(chunks_per_block):
+                    valid_tokens = jnp.clip(
+                        page_context_len - jnp.int32(chunk_idx * plan.block_kv),
+                        min=0,
+                        max=plan.block_kv,
+                    ).astype(jnp.int32)
+                    plgpu.barrier_wait(k_barrier)
+
+                    def compute_qk(acc_ref):
+                        plgpu.wgmma(
+                            acc_ref,
+                            q_smem,
+                            plgpu.transpose_ref(k_smem, (1, 0)),
+                        )
+                        plgpu.wgmma_wait(0)
+                        return acc_ref[...]
+
+                    qk = pl.run_scoped(
+                        compute_qk,
+                        plgpu.ACC((padded_block_q, plan.block_kv), jnp.float32),
+                    )
+                    plgpu.barrier_arrive(k_consumed)
+
+                    qk = qk * scale_value
+                    valid_row_mask = row_ids_2d < plan.q_heads_per_kv_head
+                    col_mask = col_ids_2d < valid_tokens
+                    mask = valid_row_mask & col_mask
+                    qk = jnp.where(mask, qk, -jnp.inf)
+
+                    qk_max = qk.max(axis=1) * log2e
+                    m_candidate = jnp.maximum(m_i, qk_max)
+                    m_ij = m_candidate
+                    safe_diff = jnp.where(m_i == m_ij, 0.0, m_i - m_ij)
+                    alpha = jnp.exp2(safe_diff)
+                    m_i = m_ij
+                    p_exponent = qk * log2e - lax.broadcast_in_dim(m_ij, qk.shape, [0])
+                    p = jnp.exp2(jnp.where(mask, p_exponent, -jnp.inf))
+                    p = jnp.where(mask, p, 0.0)
+                    acc = acc * lax.broadcast_in_dim(alpha, acc.shape, [0])
+                    l_i = l_i * alpha + p.sum(axis=1)
+
+                    p16 = p.astype(q.dtype)
+                    plgpu.barrier_wait(v_barrier)
+
+                    def compute_pv(pv_acc_ref):
+                        plgpu.wgmma(pv_acc_ref, p16, v_smem)
+                        plgpu.wgmma_wait(0)
+                        return pv_acc_ref[...]
+
+                    pv = pl.run_scoped(
+                        compute_pv,
+                        plgpu.ACC((padded_block_q, plan.head_dim), jnp.float32),
+                    )
+                    acc = acc + pv
+                    plgpu.barrier_arrive(v_consumed)
+
+            acc_ref[batch_idx, split_idx, kv_head_idx, :, :] = acc.astype(jnp.float32)
+            l_ref[batch_idx, split_idx, kv_head_idx, :] = l_i.astype(jnp.float32)
+            m_ref[batch_idx, split_idx, kv_head_idx, :] = m_i.astype(jnp.float32)
+
+    acc_grouped_padded, l_grouped_padded, m_grouped_padded = plgpu.kernel(
+        kernel_entry,
+        out_shape=[
+            jax.ShapeDtypeStruct(
+                (
+                    plan.batch_size,
+                    plan.k_splits,
+                    plan.num_kv_heads,
+                    padded_block_q,
+                    plan.head_dim,
+                ),
+                jnp.float32,
+            ),
+            jax.ShapeDtypeStruct(
+                (
+                    plan.batch_size,
+                    plan.k_splits,
+                    plan.num_kv_heads,
+                    padded_block_q,
+                ),
+                jnp.float32,
+            ),
+            jax.ShapeDtypeStruct(
+                (
+                    plan.batch_size,
+                    plan.k_splits,
+                    plan.num_kv_heads,
+                    padded_block_q,
+                ),
+                jnp.float32,
+            ),
+        ],
+        scratch_shapes=dict(
+            q_smem=plgpu.SMEM(
+                (padded_block_q, plan.head_dim),
+                q.dtype,
+                transforms=transforms,
+            ),
+            k_smem=plgpu.SMEM(
+                (plan.block_kv, plan.head_dim),
+                k_cache.dtype,
+                transforms=transforms,
+            ),
+            v_smem=plgpu.SMEM(
+                (plan.block_kv, plan.head_dim),
+                v_cache.dtype,
+                transforms=transforms,
+            ),
+            q_barrier=plgpu.Barrier(num_barriers=1),
+            k_barrier=plgpu.Barrier(num_barriers=1),
+            v_barrier=plgpu.Barrier(num_barriers=1),
+            k_consumed=plgpu.Barrier(
+                num_arrivals=1,
+                num_barriers=1,
+            ),
+            v_consumed=plgpu.Barrier(
+                num_arrivals=1,
+                num_barriers=1,
+            ),
+        ),
+        grid=(plan.batch_size, plan.num_kv_heads, plan.k_splits),
+        grid_names=("batch", "kv_heads", "splits"),
+        num_threads=2,
+        thread_name="wg",
+        compiler_params=compiler_params,
+    )(
+        q_grouped_padded,
+        k_cache_flat,
+        v_cache_flat,
+        block_tables,
+        context_lens,
+        scale_arr,
+    )
+
+    acc_grouped = acc_grouped_padded[:, :, :, : plan.q_heads_per_kv_head, :]
+    l_grouped = l_grouped_padded[:, :, :, : plan.q_heads_per_kv_head]
+    m_grouped = m_grouped_padded[:, :, :, : plan.q_heads_per_kv_head]
+    acc_partial = acc_grouped.reshape(
+        plan.batch_size,
+        plan.k_splits,
+        plan.num_heads,
+        plan.head_dim,
+    )
+    l_partial = l_grouped.reshape(plan.batch_size, plan.k_splits, plan.num_heads)
+    m_partial = m_grouped.reshape(plan.batch_size, plan.k_splits, plan.num_heads)
+    return acc_partial, l_partial, m_partial
+
+
+@partial(jax.jit, static_argnames=("plan",))
+def _compute_throughput_v2_partials(
+    *,
+    q: jax.Array,
+    k_cache: jax.Array,
+    v_cache: jax.Array,
+    block_tables: jax.Array,
+    context_lens: jax.Array,
+    scale: float,
+    plan: ThroughputV2Plan,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Compute bridge-free throughput_v2 partials without using the batched core."""
+    if plan.partial_kernel == "row_partition_mosaic_v1":
+        return _compute_throughput_v2_partials_mosaic(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_tables=block_tables,
+            context_lens=context_lens,
+            scale=scale,
+            plan=plan,
+        )
+    return _compute_throughput_v2_partials_jax(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        scale=scale,
+        plan=plan,
     )
 
 
@@ -1984,34 +2614,52 @@ def paged_decode_attention_mosaic_throughput_v2(
     split_k: int = 0,
     prepared_metadata_cache: dict[tuple, object] | None = None,
 ) -> jax.Array:
-    """Scaffolding entry point for the future long-context throughput-v2 path.
+    """Bridge-free throughput_v2 path: row-native partials plus device reduction."""
+    _check_mosaic_available()
 
-    This remains non-default and intentionally falls back to the current
-    throughput implementation while preserving a distinct runtime and cache
-    boundary for future bridge-free work.
-    """
+    batch_size, num_heads, head_dim = q.shape
+    _, cache_block_size, num_kv_heads, cache_head_dim = k_cache.shape
+    if cache_block_size != block_size:
+        raise ValueError(f"block_size mismatch: cache={cache_block_size} arg={block_size}")
+    if cache_head_dim != head_dim:
+        raise ValueError(f"head_dim mismatch: q={head_dim} cache={cache_head_dim}")
+    if num_heads % num_kv_heads != 0:
+        raise ValueError(
+            f"num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+        )
+    if block_tables.shape[1] == 0:
+        return jnp.zeros_like(q)
+
     plan = build_paged_decode_throughput_v2_plan(
         q=q,
         block_tables=block_tables,
         context_lens=context_lens,
         block_size=block_size,
+        num_kv_heads=num_kv_heads,
         config=config,
         split_k=split_k,
     )
     if prepared_metadata_cache is not None:
-        prepared_metadata_cache.setdefault(("throughput_v2_plan",), plan)
-    return paged_decode_attention_mosaic_throughput(
+        plan = prepared_metadata_cache.setdefault(plan.metadata_cache_key, plan)
+
+    acc_partial, l_partial, m_partial = _compute_throughput_v2_partials(
         q=q,
         k_cache=k_cache,
         v_cache=v_cache,
         block_tables=block_tables,
         context_lens=context_lens,
         scale=scale,
-        block_size=block_size,
-        config=config,
-        split_k=split_k,
-        prepared_metadata_cache=prepared_metadata_cache,
+        plan=plan,
     )
+    out = reduce_partitioned_decode_partials(
+        acc_partial,
+        l_partial,
+        m_partial,
+        axis=1,
+        family="throughput_v2",
+        backend_override=plan.reduction_backend,
+    )
+    return out.astype(q.dtype)
 
 
 # =============================================================================

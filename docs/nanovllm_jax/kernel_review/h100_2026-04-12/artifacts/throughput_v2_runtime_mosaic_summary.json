@@ -1,0 +1,193 @@
+{
+  "artifacts": {
+    "decode_schedule_path": "/workspace/out/throughput_v2_runtime_2026-04-12/throughput_v2_mosaic/raw/decode_schedule.jsonl",
+    "decode_schedule_records": 15,
+    "decode_step_profile_path": "/workspace/out/throughput_v2_runtime_2026-04-12/throughput_v2_mosaic/raw/decode_step_profile.jsonl",
+    "decode_step_records": 15,
+    "run_manifest_path": "/workspace/out/throughput_v2_runtime_2026-04-12/throughput_v2_mosaic/run_manifest.json"
+  },
+  "counters": {
+    "kv_update_calls": 0,
+    "kv_update_duplicate_slot_pct": null,
+    "kv_update_duplicate_slots": 0,
+    "kv_update_skipped_token_pct": null,
+    "kv_update_skipped_tokens": 0,
+    "kv_update_tokens": 0,
+    "kv_update_valid_token_pct": null,
+    "kv_update_valid_tokens": 0
+  },
+  "format_version": 1,
+  "generated_at_utc": "2026-04-12T11:26:19.547009+00:00",
+  "histograms": {
+    "block_table_actions": {
+      "full_block_table_transfer": 1,
+      "reuse_block_tables": 14
+    },
+    "decode_input_actions": {
+      "full_transfer": 1,
+      "patch_active_rows": 14
+    },
+    "decode_schedule_actions": {
+      "create": 1,
+      "reuse_block_tables": 14
+    },
+    "kv_update_backends": {
+      "scatter": 15
+    },
+    "kv_update_measured": {
+      "False": 15
+    },
+    "partitioned_decode_reduction_backends": {},
+    "partitioned_decode_reduction_families": {},
+    "partitioned_decode_reduction_measured": {
+      "False": 15
+    },
+    "prepared_metadata_actions": {
+      "clear_initial": 1,
+      "clear_schedule_changed": 14
+    }
+  },
+  "manifest": {
+    "env": {
+      "NANOVLLM_JAX_DIAGNOSTICS_DIR": "/workspace/out/throughput_v2_runtime_2026-04-12/throughput_v2_mosaic/raw",
+      "NANOVLLM_JAX_DUMP_DECODE_SCHEDULE": "1",
+      "NANOVLLM_JAX_ENABLE_THROUGHPUT_V2_MOSAIC": "1",
+      "NANOVLLM_JAX_MOSAIC_DECODE_KERNEL": "throughput_v2",
+      "NANOVLLM_JAX_PROFILE_DECODE_STEP": "1",
+      "NANOVLLM_JAX_USE_MOSAIC_DECODE": "1"
+    },
+    "format_version": 1,
+    "generated_at_utc": "2026-04-12T11:26:19.536857+00:00",
+    "git": {
+      "branch": "expert/h100-mosaic-kernel-review-2026-04-12",
+      "dirty": true,
+      "repo_root": "/workspace/nanovllm_jax",
+      "sha": "6b04b042d5ac290b54de79cfa5de844d2a8a6c1f"
+    },
+    "invocation": {
+      "argv": [
+        "profile_decode_runtime.py",
+        "--output-dir",
+        "/workspace/out/throughput_v2_runtime_2026-04-12/throughput_v2_mosaic",
+        "--decode-backend",
+        "mosaic",
+        "--max-tokens",
+        "16",
+        "--temperature",
+        "0.0001",
+        "--prompt",
+        "Summarize the word latency in one short sentence."
+      ],
+      "cwd": "/workspace/nanovllm_jax",
+      "entrypoint": "profile_decode_runtime.py"
+    },
+    "python": {
+      "executable": "/usr/bin/python3",
+      "version": "3.11.10"
+    },
+    "runtime": {
+      "decode_attention_backend": "mosaic",
+      "enforce_eager": false,
+      "kv_update_backend": "default",
+      "max_num_seqs": 1,
+      "mosaic_kernel_family": "default",
+      "mosaic_min_decode_batch": "default",
+      "mosaic_throughput_min_decode_batch": "default",
+      "tensor_parallel_size": 1
+    }
+  },
+  "model_path": "/workspace/models/Qwen3-0.6B",
+  "output_dir": "/workspace/out/throughput_v2_runtime_2026-04-12/throughput_v2_mosaic",
+  "outputs": {
+    "count": 1,
+    "token_counts": [
+      16
+    ]
+  },
+  "prompts": {
+    "count": 1,
+    "items": [
+      "Summarize the word latency in one short sentence."
+    ]
+  },
+  "raw_dir": "/workspace/out/throughput_v2_runtime_2026-04-12/throughput_v2_mosaic/raw",
+  "runtime": {
+    "decode_attention_backend": "mosaic",
+    "enforce_eager": false,
+    "kv_update_backend": "default",
+    "max_num_seqs": 1,
+    "mosaic_kernel_family": "default",
+    "mosaic_min_decode_batch": "default",
+    "mosaic_throughput_min_decode_batch": "default",
+    "tensor_parallel_size": 1
+  },
+  "sampling": {
+    "max_tokens": 16,
+    "temperature": 0.0001
+  },
+  "timings": {
+    "decode_step_count": 15,
+    "model_execute_subcomponents": {
+      "kv_update_s": {
+        "max_s": null,
+        "mean_s": null,
+        "records_with_value": 0,
+        "share_of_model_execute_pct": 0.0,
+        "share_of_top_level_pct": 0.0,
+        "total_s": 0.0
+      },
+      "partitioned_decode_reduction_s": {
+        "max_s": null,
+        "mean_s": null,
+        "records_with_value": 0,
+        "share_of_model_execute_pct": 0.0,
+        "share_of_top_level_pct": 0.0,
+        "total_s": 0.0
+      }
+    },
+    "model_execute_total_s": 4.48836106620729,
+    "top_level": {
+      "model_execute_s": {
+        "max_s": 4.069704085588455,
+        "mean_s": 0.299224071080486,
+        "records_with_value": 15,
+        "share_of_model_execute_pct": null,
+        "share_of_top_level_pct": 98.49726929726447,
+        "total_s": 4.48836106620729
+      },
+      "postprocess_s": {
+        "max_s": 5.2208080887794495e-05,
+        "mean_s": 1.2044732769330342e-05,
+        "records_with_value": 15,
+        "share_of_model_execute_pct": null,
+        "share_of_top_level_pct": 0.003964832384341176,
+        "total_s": 0.00018067099153995514
+      },
+      "prepare_decode_s": {
+        "max_s": 0.034950122237205505,
+        "mean_s": 0.004070998976627985,
+        "records_with_value": 15,
+        "share_of_model_execute_pct": null,
+        "share_of_top_level_pct": 1.3400736146055496,
+        "total_s": 0.061064984649419785
+      },
+      "sampler_s": {
+        "max_s": 0.0009290780872106552,
+        "mean_s": 0.0004767251511414846,
+        "records_with_value": 15,
+        "share_of_model_execute_pct": null,
+        "share_of_top_level_pct": 0.15692629748404013,
+        "total_s": 0.007150877267122269
+      },
+      "scheduler_s": {
+        "max_s": 2.2491440176963806e-05,
+        "mean_s": 5.364790558815002e-06,
+        "records_with_value": 15,
+        "share_of_model_execute_pct": null,
+        "share_of_top_level_pct": 0.001765958261602852,
+        "total_s": 8.047185838222504e-05
+      }
+    },
+    "top_level_total_s": 4.556838070973754
+  }
+}

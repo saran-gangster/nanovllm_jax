@@ -9,6 +9,30 @@ The specific request is:
 - describe how the new kernel should be written in Pallas Mosaic GPU
 - use the measurements and code references here, not generic FlashAttention advice
 
+## Update After The Initial Packet
+
+This branch moved after the initial packet was prepared.
+
+The most important follow-up result on April 12, 2026 is:
+
+- a new env-gated Pallas Mosaic `throughput_v2` partials kernel now exists behind the same `throughput_v2` boundary
+- on a later H100 NVL session, that kernel beat `blockwise` on the full six-shape primary synthetic gate
+- the same path stayed within roughly `1e-3` max abs diff against `blockwise` on all six validated rows
+- a short controlled real-model runtime probe also moved in the same direction
+
+That means the original expert recommendation to replace the old bridge with a different kernel boundary was correct, and the branch now contains an initial implementation of that recommendation.
+
+The authoritative follow-up result note is now:
+
+- [results_h100_2026-04-12.md](./results_h100_2026-04-12.md)
+
+New tracked artifacts added after the initial packet:
+
+- [artifacts/throughput_v2_mosaic_matrix_summary.json](./artifacts/throughput_v2_mosaic_matrix_summary.json)
+- [artifacts/throughput_v2_mosaic_verify_summary.json](./artifacts/throughput_v2_mosaic_verify_summary.json)
+- [artifacts/throughput_v2_runtime_blockwise_summary.json](./artifacts/throughput_v2_runtime_blockwise_summary.json)
+- [artifacts/throughput_v2_runtime_mosaic_summary.json](./artifacts/throughput_v2_runtime_mosaic_summary.json)
+
 ## What We Need From The Expert
 
 Please answer these questions directly:

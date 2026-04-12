@@ -20,6 +20,17 @@ def test_parse_case_spec_requires_name_and_family() -> None:
     assert case["use_schedule_barrier"] is False
 
 
+def test_parse_case_spec_keeps_numeric_values_numeric() -> None:
+    case = parse_case_spec(
+        "name=throughput_v2,family=throughput_v2,num_compute_wgs=1,throughput_split_k=0",
+    )
+
+    assert case["num_compute_wgs"] == 1
+    assert isinstance(case["num_compute_wgs"], int)
+    assert case["throughput_split_k"] == 0
+    assert isinstance(case["throughput_split_k"], int)
+
+
 def test_build_worker_command_includes_case_and_common_args(tmp_path: Path) -> None:
     command = build_worker_command(
         repo_root="/repo",
@@ -52,6 +63,37 @@ def test_build_worker_command_includes_case_and_common_args(tmp_path: Path) -> N
     assert "baseline" in command
     assert "--verify-against-blockwise" in command
     assert "--output-json" in command
+
+
+def test_build_worker_command_emits_boolean_optional_false_flag(tmp_path: Path) -> None:
+    command = build_worker_command(
+        repo_root="/repo",
+        common_args={
+            "batch_size": 512,
+            "num_heads": 16,
+            "num_kv_heads": 8,
+            "head_dim": 128,
+            "block_size": 256,
+            "max_blocks_per_seq": 16,
+            "num_blocks": 4096,
+            "dtype": "bfloat16",
+            "seed": 0,
+        },
+        case={
+            "name": "throughput_v2",
+            "family": "throughput_v2",
+            "block_q": 64,
+            "block_kv": 64,
+            "num_compute_wgs": 1,
+            "use_schedule_barrier": False,
+        },
+        output_json=tmp_path / "out.json",
+        warmup=5,
+        iters=20,
+    )
+
+    assert "--no-use-schedule-barrier" in command
+    assert "--use-schedule-barrier" not in command
 
 
 def test_summarize_and_compare_kernel_case_runs(tmp_path: Path) -> None:

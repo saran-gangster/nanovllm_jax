@@ -16,8 +16,9 @@ from nanovllm_jax.utils.decode_profile_artifacts import (
 )
 
 
-_BOOL_TRUE = {"1", "true", "yes", "on"}
-_BOOL_FALSE = {"0", "false", "no", "off"}
+_BOOL_TRUE = {"true", "yes", "on"}
+_BOOL_FALSE = {"false", "no", "off"}
+_BOOLEAN_OPTIONAL_ARGS = {"use_schedule_barrier"}
 
 
 def _coerce_case_value(raw: str) -> Any:
@@ -84,6 +85,8 @@ def build_worker_command(
         if isinstance(value, bool):
             if value:
                 command.append(cli_key)
+            elif key in _BOOLEAN_OPTIONAL_ARGS:
+                command.append(f"--no-{key.replace('_', '-')}")
             continue
         command.extend([cli_key, str(value)])
     return command

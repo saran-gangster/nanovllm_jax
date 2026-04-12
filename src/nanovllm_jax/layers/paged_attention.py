@@ -211,8 +211,21 @@ def _lookup_mosaic_variant_table(
 def _heuristic_mosaic_variant(
     *,
     padded_batch: int,
+    head_dim: int,
     max_blocks_per_seq: int,
 ) -> str:
+    if (
+        mosaic_attn is not None
+        and getattr(
+            mosaic_attn,
+            "_should_use_throughput_v2_mosaic_kernel",
+            lambda: False,
+        )()
+        and head_dim >= 128
+        and padded_batch >= 512
+        and max_blocks_per_seq >= 16
+    ):
+        return "throughput_v2"
     if max_blocks_per_seq >= 32 and padded_batch >= 512:
         return "throughput"
     if max_blocks_per_seq == 24 and padded_batch >= 256:
@@ -244,6 +257,7 @@ def _select_mosaic_decode_variant(
     if variant is None:
         variant = _heuristic_mosaic_variant(
             padded_batch=padded_batch,
+            head_dim=head_dim,
             max_blocks_per_seq=max_blocks_per_seq,
         )
     state.variant_selection_cache[shape_key] = variant
@@ -472,12 +486,13 @@ def _maybe_run_mosaic_decode(
             if not throughput_shape_eligible:
                 continue
             try:
+                throughput_v2_block_kv = 64 if (block_size_int % 64 == 0) else block_kv
                 throughput_v2_config = mosaic_attn.MosaicAttentionConfig(
-                    block_q=block_q,
-                    block_kv=block_kv,
-                    max_concurrent_steps=max(2, _MOSAIC_THROUGHPUT_NUM_STAGES),
-                    use_schedule_barrier=True,
-                    num_compute_wgs=2,
+                    block_q=64,
+                    block_kv=throughput_v2_block_kv,
+                    max_concurrent_steps=2,
+                    use_schedule_barrier=False,
+                    num_compute_wgs=1,
                 )
                 out = mosaic_attn.paged_decode_attention_mosaic_throughput_v2(
                     q=q,

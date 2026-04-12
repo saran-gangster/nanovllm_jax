@@ -116,6 +116,22 @@ def test_select_mosaic_decode_variant_auto_policy() -> None:
     ) == "latency"
 
 
+def test_select_mosaic_decode_variant_auto_policy_prefers_throughput_v2_when_enabled(monkeypatch) -> None:
+    pa._MOSAIC_DECODE_FAMILY_TABLE = {}
+    _dispatch_state().variant_selection_cache.clear()
+    monkeypatch.setattr(pa, "mosaic_attn", SimpleNamespace(
+        _should_use_throughput_v2_mosaic_kernel=lambda: True,
+    ))
+
+    assert pa._select_mosaic_decode_variant(
+        requested_variant="auto",
+        padded_batch=512,
+        head_dim=128,
+        max_blocks_per_seq=16,
+        block_size=256,
+    ) == "throughput_v2"
+
+
 def test_select_mosaic_decode_variant_table_override_and_fallback() -> None:
     key = (512, 128, 16, 256)
     pa._MOSAIC_DECODE_FAMILY_TABLE = {key: "baseline"}
@@ -235,6 +251,7 @@ def test_mosaic_decode_prefers_throughput_family(monkeypatch) -> None:
 def test_mosaic_decode_prefers_throughput_v2_family(monkeypatch) -> None:
     throughput_out = object()
     state = _dispatch_state()
+    config_kwargs = {}
 
     class DummyMosaic:
         @staticmethod
@@ -243,6 +260,7 @@ def test_mosaic_decode_prefers_throughput_v2_family(monkeypatch) -> None:
 
         @staticmethod
         def MosaicAttentionConfig(**_kwargs):
+            config_kwargs.update(_kwargs)
             return SimpleNamespace()
 
     monkeypatch.setattr(pa, "MOSAIC_AVAILABLE", True)
@@ -277,6 +295,11 @@ def test_mosaic_decode_prefers_throughput_v2_family(monkeypatch) -> None:
         block_size=256,
     )
     assert out is throughput_out
+    assert config_kwargs["block_q"] == 64
+    assert config_kwargs["block_kv"] == 64
+    assert config_kwargs["max_concurrent_steps"] == 2
+    assert config_kwargs["use_schedule_barrier"] is False
+    assert config_kwargs["num_compute_wgs"] == 1
 
 
 def test_latency_failure_falls_back_to_baseline(monkeypatch) -> None:
@@ -919,6 +942,7 @@ def test_throughput_v2_uses_family_specific_decode_schedule_packet_cache(monkeyp
     throughput_out = object()
     state = _dispatch_state()
     cache_ids: list[int] = []
+    cache_sizes: list[int] = []
 
     class DummyMosaic:
         @staticmethod
@@ -929,6 +953,7 @@ def test_throughput_v2_uses_family_specific_decode_schedule_packet_cache(monkeyp
         def paged_decode_attention_mosaic_throughput_v2(*, prepared_metadata_cache=None, **_kwargs):
             assert prepared_metadata_cache is not None
             cache_ids.append(id(prepared_metadata_cache))
+            cache_sizes.append(len(prepared_metadata_cache))
             prepared_metadata_cache.setdefault(("sentinel",), object())
             return throughput_out
 
@@ -994,6 +1019,7 @@ def test_throughput_v2_uses_family_specific_decode_schedule_packet_cache(monkeyp
     assert out2 is throughput_out
     assert len(cache_ids) == 2
     assert cache_ids[0] == cache_ids[1]
+    assert cache_sizes == [0, 1]
     assert packet.prepared_metadata_entries == 1
 
 

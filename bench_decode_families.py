@@ -20,6 +20,7 @@ import numpy as np
 
 from nanovllm_jax.layers.mosaic_gpu_attention import (
     MosaicAttentionConfig,
+    _resolve_throughput_v2_config,
     _select_latency_k_splits,
     _select_throughput_k_splits,
     batched_decode_attention_mosaic,
@@ -215,7 +216,17 @@ def _build_family_runner(
             notes,
         )
 
-    config = _config_from_args(args)
+    requested_config = _config_from_args(args)
+    config = requested_config
+    if family == "throughput_v2":
+        config = _resolve_throughput_v2_config(args.block_size, requested_config)
+        notes["requested_config"] = {
+            "block_q": requested_config.block_q,
+            "block_kv": requested_config.block_kv,
+            "max_concurrent_steps": requested_config.max_concurrent_steps,
+            "use_schedule_barrier": requested_config.use_schedule_barrier,
+            "num_compute_wgs": requested_config.num_compute_wgs,
+        }
     notes["config"] = {
         "block_q": config.block_q,
         "block_kv": config.block_kv,
@@ -326,16 +337,29 @@ def _build_family_runner(
             block_tables=block_tables,
             context_lens=context_lens,
             block_size=args.block_size,
+            num_kv_heads=args.num_kv_heads,
             config=config,
             split_k=args.throughput_split_k,
         )
         notes["v2_plan"] = {
-            "block_q": plan.block_q,
             "block_kv": plan.block_kv,
+            "q_heads_per_kv_head": plan.q_heads_per_kv_head,
             "k_splits": plan.k_splits,
             "pages_per_partition": plan.pages_per_partition,
+            "partial_kernel": plan.partial_kernel,
             "uses_wrapper_partitioning": plan.uses_wrapper_partitioning,
+            "uses_batched_core": plan.uses_batched_core,
             "reduction_boundary": plan.reduction_boundary,
+            "reduction_backend": plan.reduction_backend,
+            "metadata_model": plan.metadata_model,
+            "heuristic_num_compute_wgs": plan.num_compute_wgs,
+            "heuristic_max_concurrent_steps": plan.max_concurrent_steps,
+            "heuristic_use_schedule_barrier": plan.use_schedule_barrier,
+            "launch_block_q": plan.launch_block_q,
+            "launch_num_compute_wgs": plan.launch_num_compute_wgs,
+            "launch_num_memory_wgs": plan.launch_num_memory_wgs,
+            "launch_max_concurrent_steps": plan.launch_max_concurrent_steps,
+            "launch_use_schedule_barrier": plan.launch_use_schedule_barrier,
         }
         prepared_metadata_cache: dict[tuple[Any, ...], object] = {}
         notes["prepared_metadata_cache_primed"] = False

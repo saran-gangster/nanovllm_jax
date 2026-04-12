@@ -3,7 +3,8 @@
 This module owns the public paged-attention runtime surface:
 - a dense vectorized reference path,
 - a blockwise streaming fallback path,
-- and Mosaic GPU dispatch for baseline, latency, and throughput-oriented kernels.
+- and Mosaic GPU dispatch for baseline, latency, throughput, and throughput-v2
+  preview kernels.
 
 The Mosaic family remains experimental and is intended as an opt-in preview while
 GPU bring-up work is paused between hardware access windows.
@@ -20,6 +21,8 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 from jax import lax
+
+from nanovllm_jax.engine.decode_schedule import get_decode_schedule_packet
 
 # Check if Pallas with Mosaic GPU is available
 try:
@@ -55,6 +58,7 @@ class AttentionBackendRuntimeState:
     baseline_disabled_reason: str | None = None
     latency_disabled_reason: str | None = None
     throughput_disabled_reason: str | None = None
+    throughput_v2_disabled_reason: str | None = None
     variant_selection_cache: dict[_MOSAIC_VARIANT_KEY, str] = field(default_factory=dict)
     failure_cache: dict[_MOSAIC_FAILURE_KEY, str] = field(default_factory=dict)
     tile_cache: dict[tuple[int, int, int, int, int], object] = field(default_factory=dict)
@@ -65,6 +69,7 @@ class AttentionBackendRuntimeState:
         self.baseline_disabled_reason = None
         self.latency_disabled_reason = None
         self.throughput_disabled_reason = None
+        self.throughput_v2_disabled_reason = None
         self.variant_selection_cache.clear()
         self.failure_cache.clear()
         self.tile_cache.clear()
@@ -101,14 +106,35 @@ def set_attention_backend_runtime_state(
     )
     return _ACTIVE_BACKEND_RUNTIME_STATE
 
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
 # Mosaic kernel tuning defaults (overridable via configure_attention_backends)
 _MOSAIC_BLOCK_Q = 64
-_MOSAIC_BLOCK_KV = 256
+# H100 quick screens on 2026-04-03 showed the current Mosaic families were
+# materially slower at block_kv=256 than at block_kv=64 on the tested shapes.
+_MOSAIC_BLOCK_KV = 64
 _MOSAIC_MAX_CONCURRENT_STEPS = 2
-_MOSAIC_MIN_DECODE_BATCH = 512  # min padded batch for auto-selection
+_MOSAIC_MIN_DECODE_BATCH = _env_int(
+    "NANOVLLM_JAX_INTERNAL_MOSAIC_MIN_DECODE_BATCH",
+    512,
+)  # min padded batch for auto-selection
 _MOSAIC_THROUGHPUT_SPLIT_K = 0
 _MOSAIC_THROUGHPUT_NUM_STAGES = 2
-_MOSAIC_THROUGHPUT_MIN_DECODE_BATCH = 128
+_MOSAIC_THROUGHPUT_MIN_DECODE_BATCH = _env_int(
+    "NANOVLLM_JAX_INTERNAL_MOSAIC_THROUGHPUT_MIN_DECODE_BATCH",
+    128,
+)
 _MOSAIC_THROUGHPUT_RESCALE_THRESHOLD = 1.0
 _MOSAIC_THROUGHPUT_AUTOTUNE = False
 _MOSAIC_DECODE_KERNEL_FAMILY = os.environ.get(
@@ -124,7 +150,11 @@ _MOSAIC_DECODE_FAILURE_CACHE_MAX = 256
 
 def _normalize_mosaic_variant(raw: object) -> str:
     variant = str(raw).strip().lower()
-    return variant if variant in {"auto", "baseline", "latency", "throughput"} else "auto"
+    return (
+        variant
+        if variant in {"auto", "baseline", "latency", "throughput", "throughput_v2"}
+        else "auto"
+    )
 
 
 def _parse_shape_key(raw_key: str) -> tuple[int, int, int, int] | None:
@@ -350,6 +380,7 @@ def _maybe_run_mosaic_decode(
     context_lens: jax.Array,
     scale: float,
     block_size: int | jax.Array,
+    decode_schedule_token: int = 0,
 ):
     """Attempt Mosaic decode kernel, falling back silently on failure.
 
@@ -360,10 +391,11 @@ def _maybe_run_mosaic_decode(
     The threshold is controlled by module-private tuning used by the
     profiling scripts and environment overrides.
 
-    Tile metadata is cached across layers within a single JIT trace to avoid
-    redundant computation (28 layers × identical metadata).
+    Tile metadata is cached on the runner-owned decode schedule packet during
+    tracing to avoid redundant graph construction across attention layers.
     """
     state = get_attention_backend_runtime_state()
+    schedule_packet = get_decode_schedule_packet(decode_schedule_token)
 
     if not MOSAIC_AVAILABLE or mosaic_attn is None:
         return None
@@ -410,7 +442,9 @@ def _maybe_run_mosaic_decode(
         block_size=block_size_int,
     )
 
-    if selected_variant == "throughput":
+    if selected_variant == "throughput_v2":
+        variant_chain = ("throughput_v2", "throughput", "baseline")
+    elif selected_variant == "throughput":
         if requested_variant == "auto":
             variant_chain = ("throughput", "latency", "baseline")
         else:
@@ -434,6 +468,39 @@ def _maybe_run_mosaic_decode(
         if failure_key in state.failure_cache:
             continue
 
+        if candidate == "throughput_v2":
+            if not throughput_shape_eligible:
+                continue
+            try:
+                throughput_v2_config = mosaic_attn.MosaicAttentionConfig(
+                    block_q=block_q,
+                    block_kv=block_kv,
+                    max_concurrent_steps=max(2, _MOSAIC_THROUGHPUT_NUM_STAGES),
+                    use_schedule_barrier=True,
+                    num_compute_wgs=2,
+                )
+                out = mosaic_attn.paged_decode_attention_mosaic_throughput_v2(
+                    q=q,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    block_tables=block_tables,
+                    context_lens=context_lens,
+                    scale=scale,
+                    block_size=block_size_int,
+                    config=throughput_v2_config,
+                    split_k=_MOSAIC_THROUGHPUT_SPLIT_K,
+                    prepared_metadata_cache=(
+                        schedule_packet.metadata_cache_for_family("throughput_v2")
+                        if schedule_packet is not None
+                        else None
+                    ),
+                )
+                return out
+            except Exception as exc:
+                state.throughput_v2_disabled_reason = str(exc)
+                _record_mosaic_failure(failure_key, state.throughput_v2_disabled_reason)
+                continue
+
         if candidate == "throughput":
             if not throughput_shape_eligible:
                 continue
@@ -445,7 +512,7 @@ def _maybe_run_mosaic_decode(
                     use_schedule_barrier=True,
                     num_compute_wgs=2,
                 )
-                return mosaic_attn.paged_decode_attention_mosaic_throughput(
+                out = mosaic_attn.paged_decode_attention_mosaic_throughput(
                     q=q,
                     k_cache=k_cache,
                     v_cache=v_cache,
@@ -457,7 +524,13 @@ def _maybe_run_mosaic_decode(
                     split_k=_MOSAIC_THROUGHPUT_SPLIT_K,
                     rescale_threshold=_MOSAIC_THROUGHPUT_RESCALE_THRESHOLD,
                     autotune=_MOSAIC_THROUGHPUT_AUTOTUNE,
+                    prepared_metadata_cache=(
+                        schedule_packet.metadata_cache_for_family("throughput")
+                        if schedule_packet is not None
+                        else None
+                    ),
                 )
+                return out
             except Exception as exc:
                 state.throughput_disabled_reason = str(exc)
                 _record_mosaic_failure(failure_key, state.throughput_disabled_reason)
@@ -474,7 +547,7 @@ def _maybe_run_mosaic_decode(
                     use_schedule_barrier=True,
                     num_compute_wgs=2,
                 )
-                return mosaic_attn.paged_decode_attention_mosaic_latency(
+                out = mosaic_attn.paged_decode_attention_mosaic_latency(
                     q=q,
                     k_cache=k_cache,
                     v_cache=v_cache,
@@ -483,7 +556,13 @@ def _maybe_run_mosaic_decode(
                     scale=scale,
                     block_size=block_size_int,
                     config=latency_config,
+                    prepared_metadata_cache=(
+                        schedule_packet.metadata_cache_for_family("latency")
+                        if schedule_packet is not None
+                        else None
+                    ),
                 )
+                return out
             except Exception as exc:
                 state.latency_disabled_reason = str(exc)
                 _record_mosaic_failure(failure_key, state.latency_disabled_reason)
@@ -501,10 +580,28 @@ def _maybe_run_mosaic_decode(
                     num_compute_wgs=2,
                 )
 
-                # During one JIT trace all attention layers share block_tables/context_lens.
-                cache_key = (id(block_tables), id(context_lens), block_q, block_kv, block_size_int)
-                metadata = state.tile_cache.get(cache_key)
-                if metadata is None:
+                metadata_key = (
+                    "baseline",
+                    q.shape[0],
+                    block_q,
+                    block_kv,
+                    block_size_int,
+                )
+                if schedule_packet is not None:
+                    metadata = schedule_packet.get_or_create_metadata(
+                        "baseline",
+                        metadata_key,
+                        lambda: mosaic_attn.prepare_decode_metadata(
+                            block_tables,
+                            context_lens,
+                            q.shape[0],
+                            block_q,
+                            block_size_int,
+                            block_kv,
+                            include_unused_fields=False,
+                        ),
+                    )
+                else:
                     metadata = mosaic_attn.prepare_decode_metadata(
                         block_tables,
                         context_lens,
@@ -514,11 +611,8 @@ def _maybe_run_mosaic_decode(
                         block_kv,
                         include_unused_fields=False,
                     )
-                    state.tile_cache[cache_key] = metadata
-                    if len(state.tile_cache) > 64:
-                        state.tile_cache.clear()
 
-                return mosaic_attn.batched_decode_attention_mosaic(
+                out = mosaic_attn.batched_decode_attention_mosaic(
                     q=q,
                     k_cache=k_cache,
                     v_cache=v_cache,
@@ -528,6 +622,7 @@ def _maybe_run_mosaic_decode(
                     config=mosaic_config,
                     metadata=metadata,
                 )
+                return out
             except Exception as exc:
                 state.baseline_disabled_reason = str(exc)
                 _record_mosaic_failure(failure_key, state.baseline_disabled_reason)
@@ -1070,7 +1165,7 @@ def paged_decode_attention_mosaic(
 # High-Level API
 # =============================================================================
 
-@partial(jax.jit, static_argnums=(5, 6))
+@partial(jax.jit, static_argnums=(5, 6, 7))
 def paged_attention(
     q: jax.Array,
     k_cache: jax.Array,
@@ -1079,6 +1174,7 @@ def paged_attention(
     context_lens: jax.Array,
     scale: float,
     block_size: int,
+    decode_schedule_token: int = 0,
 ) -> jax.Array:
     """JIT-compiled paged attention for decode phase.
     
@@ -1117,14 +1213,21 @@ def paged_attention(
             context_lens=context_lens,
             scale=scale,
             block_size=block_size,
+            decode_schedule_token=decode_schedule_token,
         )
         if mosaic_out is not None:
             return mosaic_out
 
     if state.use_blockwise_decode:
-        return paged_decode_attention_blockwise(q, k_cache, v_cache, block_tables, context_lens, scale, block_size)
+        out = paged_decode_attention_blockwise(
+            q, k_cache, v_cache, block_tables, context_lens, scale, block_size,
+        )
+        return out
 
-    return paged_decode_attention_vectorized(q, k_cache, v_cache, block_tables, context_lens, scale, block_size)
+    out = paged_decode_attention_vectorized(
+        q, k_cache, v_cache, block_tables, context_lens, scale, block_size,
+    )
+    return out
 
 
 def _paged_attention_fallback(

@@ -37,25 +37,35 @@ import math
 import os
 from functools import partial
 from pathlib import Path
+from time import perf_counter
 from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+from jax import core as jax_core
 from jax import lax
 try:
     from jax.extend import backend as jax_backend
 except ImportError:
     jax_backend = None
 
+from nanovllm_jax.utils.runtime_diagnostics import (
+    block_until_ready_tree,
+    decode_step_profiling_enabled,
+    record_partitioned_decode_reduction_stats,
+)
+
 # Check if Pallas Mosaic GPU is available
 try:
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import mosaic_gpu as plgpu
     MOSAIC_AVAILABLE = True
+    _WGMMA_ROW = getattr(plgpu.Layout, "WGMMA_ROW", plgpu.Layout.WGMMA.reduce(1))
 except ImportError:
     MOSAIC_AVAILABLE = False
     pl = None
     plgpu = None
+    _WGMMA_ROW = None
 
 
 def _check_mosaic_available():
@@ -97,15 +107,39 @@ class MosaicAttentionConfig:
             raise ValueError(f"max_concurrent_steps={self.max_concurrent_steps} must be >= 2")
 
 
+@dataclasses.dataclass(frozen=True)
+class ThroughputV2Plan:
+    """Planned long-context throughput-v2 execution metadata.
+
+    This is intentionally small and JSON-friendly so the bench path can report
+    what a future bridge-free implementation intends to optimize without
+    changing the active runtime yet.
+    """
+
+    batch_size: int
+    num_heads: int
+    head_dim: int
+    max_blocks_per_seq: int
+    block_size: int
+    block_q: int
+    block_kv: int
+    k_splits: int
+    pages_per_partition: int
+    uses_wrapper_partitioning: bool
+    reduction_boundary: str
+    metadata_cache_key: tuple[object, ...]
+
+
 _SMEM_BUDGET_BYTES = 232_448  # 228 KB on Hopper (in bytes)
 _METADATA_ALIGNMENT = 128
 _BARRIER_BYTES_PER_SLOT = 16  # heuristic: small allowance per barrier slot
-_mosaic_latency_tile_cache: dict = {}
-_mosaic_throughput_tile_cache: dict = {}
 _THROUGHPUT_SPLITK_TABLE_PATH = (
     os.environ.get("NANOVLLM_JAX_MOSAIC_THROUGHPUT_SPLITK_TABLE_PATH", "").strip() or None
 )
 _THROUGHPUT_SPLITK_TABLE: dict[tuple[int, int, int, int], int] | None = None
+_PARTITIONED_DECODE_REDUCTION_BACKEND = os.environ.get(
+    "NANOVLLM_JAX_PARTITIONED_DECODE_REDUCTION_BACKEND", "streaming"
+).strip().lower()
 
 
 def _parse_shape_key(raw_key: str) -> tuple[int, int, int, int] | None:
@@ -124,6 +158,45 @@ def _parse_shape_key(raw_key: str) -> tuple[int, int, int, int] | None:
         )
     except Exception:
         return None
+
+
+def _get_or_prepare_cached_metadata(
+    prepared_metadata_cache: dict[tuple, object] | None,
+    key: tuple,
+    factory,
+):
+    if prepared_metadata_cache is None:
+        return factory()
+    metadata = prepared_metadata_cache.get(key)
+    if metadata is None:
+        metadata = factory()
+        prepared_metadata_cache[key] = metadata
+    return metadata
+
+
+def _normalize_partitioned_decode_reduction_backend(raw: str) -> str:
+    backend = str(raw).strip().lower()
+    if backend in {"auto", "streaming"}:
+        return backend
+    raise ValueError(
+        "NANOVLLM_JAX_PARTITIONED_DECODE_REDUCTION_BACKEND must be one of: "
+        "auto|streaming"
+    )
+
+
+def _active_partitioned_decode_reduction_backend(backend_override: str | None = None) -> str:
+    source = _PARTITIONED_DECODE_REDUCTION_BACKEND if backend_override is None else backend_override
+    backend = _normalize_partitioned_decode_reduction_backend(source)
+    if backend == "auto":
+        return "streaming"
+    return backend
+
+
+def _tree_has_tracer(value) -> bool:
+    return any(
+        isinstance(leaf, jax_core.Tracer)
+        for leaf in jax.tree_util.tree_leaves(value)
+    )
 
 
 def configure_throughput_splitk_table(path: str | None) -> None:
@@ -1014,11 +1087,11 @@ def batched_decode_attention_mosaic(
             # acc: weighted sum of values
             m_i = plgpu.layout_cast(
                 jnp.full((my_block_q,), -jnp.inf, dtype=jnp.float32),
-                plgpu.Layout.WGMMA_ROW,
+                _WGMMA_ROW,
             )
             l_i = plgpu.layout_cast(
                 jnp.full((my_block_q,), 0.0, dtype=jnp.float32),
-                plgpu.Layout.WGMMA_ROW,
+                _WGMMA_ROW,
             )
             acc = plgpu.layout_cast(
                 jnp.full((my_block_q, head_dim), 0.0, dtype=jnp.float32),
@@ -1319,7 +1392,7 @@ def batched_decode_attention_mosaic(
 # Decode Rewrite Kernel (Algorithmic Pivot: Partitioned Streaming)
 # =============================================================================
 
-def _merge_split_partials(
+def _merge_split_partials_streaming(
     acc_partial: jax.Array,
     l_partial: jax.Array,
     m_partial: jax.Array,
@@ -1330,7 +1403,7 @@ def _merge_split_partials(
     """Merge split partial outputs via streaming online-softmax recurrence.
 
     This avoids materializing a full correction tensor for all splits at once,
-    reducing temporary memory pressure in latency/throughput merge paths.
+    reducing temporary memory pressure in latency/throughput reduction paths.
     """
 
     # Bring split axis to position 1 to keep the scan body simple.
@@ -1368,6 +1441,64 @@ def _merge_split_partials(
         m_final = m_next
 
     return acc_final / jnp.maximum(l_final[..., None], eps)
+
+
+def _merge_split_partials(
+    acc_partial: jax.Array,
+    l_partial: jax.Array,
+    m_partial: jax.Array,
+    *,
+    axis: int,
+    eps: float = 1e-9,
+) -> jax.Array:
+    """Compatibility wrapper for the current streaming reduction implementation."""
+    return _merge_split_partials_streaming(
+        acc_partial,
+        l_partial,
+        m_partial,
+        axis=axis,
+        eps=eps,
+    )
+
+
+def reduce_partitioned_decode_partials(
+    acc_partial: jax.Array,
+    l_partial: jax.Array,
+    m_partial: jax.Array,
+    *,
+    axis: int,
+    family: str,
+    backend_override: str | None = None,
+) -> jax.Array:
+    """Internal reduction boundary for partitioned decode families."""
+    backend = _active_partitioned_decode_reduction_backend(backend_override)
+    profiling_enabled = decode_step_profiling_enabled()
+    can_measure = profiling_enabled and not _tree_has_tracer(
+        (acc_partial, l_partial, m_partial)
+    )
+    started_at = perf_counter() if can_measure else 0.0
+
+    if backend == "streaming":
+        out = _merge_split_partials_streaming(
+            acc_partial,
+            l_partial,
+            m_partial,
+            axis=axis,
+        )
+    else:  # pragma: no cover - backend normalization guards this.
+        raise ValueError(f"Unsupported partitioned decode reduction backend: {backend}")
+
+    if profiling_enabled:
+        if can_measure:
+            block_until_ready_tree(out)
+        record_partitioned_decode_reduction_stats(
+            seconds=(perf_counter() - started_at) if can_measure else 0.0,
+            backend=backend,
+            family=family,
+            splits=int(acc_partial.shape[axis]),
+            measured=can_measure,
+        )
+    return out
 
 
 def _select_throughput_k_splits(
@@ -1482,6 +1613,7 @@ def paged_decode_attention_mosaic_latency(
     scale: float,
     block_size: int,
     config: MosaicAttentionConfig | None = None,
+    prepared_metadata_cache: dict[tuple, object] | None = None,
 ) -> jax.Array:
     """Partitioned decode path tuned for short-context latency.
 
@@ -1560,19 +1692,19 @@ def paged_decode_attention_mosaic_latency(
     block_tables_split = split_block_tables.reshape(batch_size * k_splits, pages_per_partition)
     context_lens_split = split_context_lens.reshape(batch_size * k_splits)
 
-    # Reuse split metadata across layers in a single decode step.
     cache_key = (
-        id(block_tables),
-        id(context_lens),
+        "latency",
+        batch_size,
         k_splits,
         pages_per_partition,
         kernel_config.block_q,
         kernel_config.block_kv,
         block_size,
     )
-    metadata = _mosaic_latency_tile_cache.get(cache_key)
-    if metadata is None:
-        metadata = prepare_decode_metadata(
+    metadata = _get_or_prepare_cached_metadata(
+        prepared_metadata_cache,
+        cache_key,
+        lambda: prepare_decode_metadata(
             block_tables_split,
             context_lens_split,
             q_split.shape[0],
@@ -1580,10 +1712,8 @@ def paged_decode_attention_mosaic_latency(
             block_size,
             kernel_config.block_kv,
             include_unused_fields=False,
-        )
-        _mosaic_latency_tile_cache[cache_key] = metadata
-        if len(_mosaic_latency_tile_cache) > 64:
-            _mosaic_latency_tile_cache.clear()
+        ),
+    )
 
     acc_partial, l_partial, m_partial = batched_decode_attention_mosaic(
         q=q_split,
@@ -1601,11 +1731,12 @@ def paged_decode_attention_mosaic_latency(
     l_partial = l_partial.reshape(batch_size, k_splits, num_heads)
     m_partial = m_partial.reshape(batch_size, k_splits, num_heads)
 
-    out = _merge_split_partials(
+    out = reduce_partitioned_decode_partials(
         acc_partial,
         l_partial,
         m_partial,
         axis=1,
+        family="latency",
     )
     return out.astype(q.dtype)
 
@@ -1626,6 +1757,7 @@ def paged_decode_attention_mosaic_throughput(
     split_k: int = 0,
     rescale_threshold: float = 1.0,
     autotune: bool = False,
+    prepared_metadata_cache: dict[tuple, object] | None = None,
 ) -> jax.Array:
     """Long-context throughput path with split-k and manual-barrier tuning."""
     _check_mosaic_available()
@@ -1677,23 +1809,21 @@ def paged_decode_attention_mosaic_throughput(
     if pages_per_partition <= 0:
         return jnp.zeros_like(q)
 
-    block_tables_ref = block_tables
-    context_lens_ref = context_lens
-
     # Fast path: no split, reuse one metadata schedule across layers.
     if k_splits <= 1:
         cache_key = (
-            id(block_tables_ref),
-            id(context_lens_ref),
+            "throughput",
+            batch_size,
             1,
             pages_per_partition,
             kernel_config.block_q,
             kernel_config.block_kv,
             block_size,
         )
-        metadata = _mosaic_throughput_tile_cache.get(cache_key)
-        if metadata is None:
-            metadata = prepare_decode_metadata(
+        metadata = _get_or_prepare_cached_metadata(
+            prepared_metadata_cache,
+            cache_key,
+            lambda: prepare_decode_metadata(
                 block_tables,
                 context_lens,
                 q.shape[0],
@@ -1701,10 +1831,8 @@ def paged_decode_attention_mosaic_throughput(
                 block_size,
                 kernel_config.block_kv,
                 include_unused_fields=False,
-            )
-            _mosaic_throughput_tile_cache[cache_key] = metadata
-            if len(_mosaic_throughput_tile_cache) > 64:
-                _mosaic_throughput_tile_cache.clear()
+            ),
+        )
         return batched_decode_attention_mosaic(
             q=q,
             k_cache=k_cache,
@@ -1739,17 +1867,18 @@ def paged_decode_attention_mosaic_throughput(
     context_lens_split = split_context_lens.reshape(batch_size * k_splits)
 
     cache_key = (
-        id(block_tables_ref),
-        id(context_lens_ref),
+        "throughput",
+        batch_size,
         k_splits,
         pages_per_partition,
         kernel_config.block_q,
         kernel_config.block_kv,
         block_size,
     )
-    metadata = _mosaic_throughput_tile_cache.get(cache_key)
-    if metadata is None:
-        metadata = prepare_decode_metadata(
+    metadata = _get_or_prepare_cached_metadata(
+        prepared_metadata_cache,
+        cache_key,
+        lambda: prepare_decode_metadata(
             block_tables_split,
             context_lens_split,
             q_split.shape[0],
@@ -1757,10 +1886,8 @@ def paged_decode_attention_mosaic_throughput(
             block_size,
             kernel_config.block_kv,
             include_unused_fields=False,
-        )
-        _mosaic_throughput_tile_cache[cache_key] = metadata
-        if len(_mosaic_throughput_tile_cache) > 64:
-            _mosaic_throughput_tile_cache.clear()
+        ),
+    )
 
     acc_partial, l_partial, m_partial = batched_decode_attention_mosaic(
         q=q_split,
@@ -1778,13 +1905,113 @@ def paged_decode_attention_mosaic_throughput(
     acc_partial = acc_partial.reshape(batch_size, k_splits, num_heads, head_dim)
     l_partial = l_partial.reshape(batch_size, k_splits, num_heads)
     m_partial = m_partial.reshape(batch_size, k_splits, num_heads)
-    out = _merge_split_partials(
+    out = reduce_partitioned_decode_partials(
         acc_partial,
         l_partial,
         m_partial,
         axis=1,
+        family="throughput",
     )
     return out.astype(q.dtype)
+
+
+def build_paged_decode_throughput_v2_plan(
+    *,
+    q: jax.Array,
+    block_tables: jax.Array,
+    context_lens: jax.Array,
+    block_size: int,
+    config: MosaicAttentionConfig | None = None,
+    split_k: int = 0,
+) -> ThroughputV2Plan:
+    """Build the non-active throughput-v2 execution plan.
+
+    The current implementation is a scaffolding seam only. It records the shape
+    and partitioning decisions that a future bridge-free throughput kernel
+    should own internally rather than via wrapper-side q broadcast and JAX-side
+    merge logic.
+    """
+    del context_lens
+    batch_size, num_heads, head_dim = q.shape
+    max_blocks_per_seq = block_tables.shape[1]
+    kernel_config = _resolve_latency_config(block_size, config)
+    k_splits = _select_throughput_k_splits(
+        split_k=split_k,
+        batch_size=batch_size,
+        head_dim=head_dim,
+        num_heads=num_heads,
+        block_q=kernel_config.block_q,
+        max_blocks_per_seq=max_blocks_per_seq,
+        block_size=block_size,
+        block_kv=kernel_config.block_kv,
+    )
+    pages_per_partition = (
+        (max_blocks_per_seq + k_splits - 1) // k_splits if k_splits > 0 else 0
+    )
+    return ThroughputV2Plan(
+        batch_size=batch_size,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        max_blocks_per_seq=max_blocks_per_seq,
+        block_size=block_size,
+        block_q=kernel_config.block_q,
+        block_kv=kernel_config.block_kv,
+        k_splits=k_splits,
+        pages_per_partition=pages_per_partition,
+        uses_wrapper_partitioning=False,
+        reduction_boundary="jax_merge_v1_fallback",
+        metadata_cache_key=(
+            "throughput_v2",
+            batch_size,
+            k_splits,
+            pages_per_partition,
+            kernel_config.block_q,
+            kernel_config.block_kv,
+            block_size,
+        ),
+    )
+
+
+def paged_decode_attention_mosaic_throughput_v2(
+    q: jax.Array,           # [batch_size, num_heads, head_dim]
+    k_cache: jax.Array,     # [num_blocks, block_size, num_kv_heads, head_dim]
+    v_cache: jax.Array,     # [num_blocks, block_size, num_kv_heads, head_dim]
+    block_tables: jax.Array,  # [batch_size, max_blocks_per_seq]
+    context_lens: jax.Array,  # [batch_size]
+    scale: float,
+    block_size: int,
+    config: MosaicAttentionConfig | None = None,
+    split_k: int = 0,
+    prepared_metadata_cache: dict[tuple, object] | None = None,
+) -> jax.Array:
+    """Scaffolding entry point for the future long-context throughput-v2 path.
+
+    This remains non-default and intentionally falls back to the current
+    throughput implementation while preserving a distinct runtime and cache
+    boundary for future bridge-free work.
+    """
+    plan = build_paged_decode_throughput_v2_plan(
+        q=q,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        block_size=block_size,
+        config=config,
+        split_k=split_k,
+    )
+    if prepared_metadata_cache is not None:
+        prepared_metadata_cache.setdefault(("throughput_v2_plan",), plan)
+    return paged_decode_attention_mosaic_throughput(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        scale=scale,
+        block_size=block_size,
+        config=config,
+        split_k=split_k,
+        prepared_metadata_cache=prepared_metadata_cache,
+    )
 
 
 # =============================================================================
@@ -2000,11 +2227,11 @@ def prefill_attention_mosaic(
 
                 m_i = plgpu.layout_cast(
                     jnp.full((block_q,), -jnp.inf, dtype=jnp.float32),
-                    plgpu.Layout.WGMMA_ROW,
+                    _WGMMA_ROW,
                 )
                 l_i = plgpu.layout_cast(
                     jnp.full((block_q,), 0.0, dtype=jnp.float32),
-                    plgpu.Layout.WGMMA_ROW,
+                    _WGMMA_ROW,
                 )
                 acc = plgpu.layout_cast(
                     jnp.full((block_q, head_dim), 0.0, dtype=jnp.float32),

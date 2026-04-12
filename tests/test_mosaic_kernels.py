@@ -80,8 +80,12 @@ def test_blockwise_decode_matches_vectorized_reference() -> None:
     np.testing.assert_allclose(
         np.asarray(out_blockwise),
         np.asarray(out_vectorized),
-        rtol=5e-5,
-        atol=5e-5,
+        # The blockwise path uses streaming online-softmax updates with a
+        # different reduction order than the dense vectorized reference.
+        # GPU runs, especially on Hopper, show slightly larger but still
+        # numerically small drift than CPU-only execution.
+        rtol=1e-4,
+        atol=5e-4,
     )
 
 

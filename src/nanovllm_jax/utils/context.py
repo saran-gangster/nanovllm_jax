@@ -76,13 +76,15 @@ class AttentionContext:
     # Shared metadata
     slot_mapping: jnp.ndarray | None = None
     block_tables: jnp.ndarray | None = None
+    decode_schedule_token: int = 0
     
     # LM head metadata
     last_token_indices: jnp.ndarray | None = None
 
 
 # Register AttentionContext as a JAX PyTree
-# Static fields (not traced): is_prefill, max_seqlen_q, max_seqlen_k
+# Static fields (not traced): is_prefill, max_seqlen_q, max_seqlen_k,
+#                              decode_schedule_token
 # Dynamic fields (traced as arrays): cu_seqlens_q, cu_seqlens_k, context_lens, 
 #                                     slot_mapping, block_tables, last_token_indices
 def _attention_context_flatten(ctx):
@@ -97,13 +99,18 @@ def _attention_context_flatten(ctx):
         ctx.last_token_indices,
     )
     # Aux data is the static fields
-    aux_data = (ctx.is_prefill, ctx.max_seqlen_q, ctx.max_seqlen_k)
+    aux_data = (
+        ctx.is_prefill,
+        ctx.max_seqlen_q,
+        ctx.max_seqlen_k,
+        ctx.decode_schedule_token,
+    )
     return children, aux_data
 
 
 def _attention_context_unflatten(aux_data, children):
     """Unflatten to reconstruct AttentionContext."""
-    is_prefill, max_seqlen_q, max_seqlen_k = aux_data
+    is_prefill, max_seqlen_q, max_seqlen_k, decode_schedule_token = aux_data
     cu_seqlens_q, cu_seqlens_k, context_lens, slot_mapping, block_tables, last_token_indices = children
     return AttentionContext(
         is_prefill=is_prefill,
@@ -114,6 +121,7 @@ def _attention_context_unflatten(aux_data, children):
         context_lens=context_lens,
         slot_mapping=slot_mapping,
         block_tables=block_tables,
+        decode_schedule_token=decode_schedule_token,
         last_token_indices=last_token_indices,
     )
 
@@ -170,6 +178,7 @@ def create_decode_context(
     context_lens: jnp.ndarray,
     slot_mapping: jnp.ndarray,
     block_tables: jnp.ndarray,
+    decode_schedule_token: int = 0,
 ) -> AttentionContext:
     """Create context for decode phase.
     
@@ -186,5 +195,6 @@ def create_decode_context(
         context_lens=context_lens,
         slot_mapping=slot_mapping,
         block_tables=block_tables,
+        decode_schedule_token=decode_schedule_token,
         last_token_indices=None,  # Not needed for decode (all tokens are "last")
     )

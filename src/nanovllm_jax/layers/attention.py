@@ -12,12 +12,20 @@ import os
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
+from jax import core as jax_core
 from flax import nnx
 from typing import NamedTuple
 from functools import partial
+from time import perf_counter
 
 from nanovllm_jax.utils.context import AttentionContext
+from nanovllm_jax.utils.runtime_diagnostics import (
+    block_until_ready_tree,
+    decode_step_profiling_enabled,
+    record_kv_update_stats,
+)
 
 # Try to import paged attention kernels
 try:
@@ -37,6 +45,10 @@ elif _PREFILL_ATTN_IMPL_ENV in {"xla", "cudnn"}:
     _PREFILL_ATTN_IMPL = _PREFILL_ATTN_IMPL_ENV
 else:
     _PREFILL_ATTN_IMPL = None
+
+_KV_UPDATE_BACKEND = os.environ.get(
+    "NANOVLLM_JAX_KV_UPDATE_BACKEND", "scatter"
+).strip().lower()
 
 
 def configure_prefill_backend(config) -> None:
@@ -61,6 +73,25 @@ def _prefill_attn_impl_for_dtype(dtype: jnp.dtype) -> str | None:
     if _PREFILL_ATTN_IMPL == "cudnn" and dtype not in (jnp.float16, jnp.bfloat16):
         return None  # cuDNN only supports bf16/fp16
     return _PREFILL_ATTN_IMPL
+
+
+def _normalize_kv_update_backend(raw: str) -> str:
+    backend = str(raw).strip().lower()
+    if backend in {"auto", "scatter", "compact_scatter", "sorted_compact_scatter"}:
+        return backend
+    raise ValueError(
+        "NANOVLLM_JAX_KV_UPDATE_BACKEND must be one of: "
+        "auto|scatter|compact_scatter|sorted_compact_scatter"
+    )
+
+
+def _active_kv_update_backend() -> str:
+    backend = _normalize_kv_update_backend(
+        os.environ.get("NANOVLLM_JAX_KV_UPDATE_BACKEND", _KV_UPDATE_BACKEND)
+    )
+    if backend == "auto":
+        return "scatter"
+    return backend
 
 
 class KVCache(NamedTuple):
@@ -158,6 +189,100 @@ def store_kv_to_cache(
     return k_cache, v_cache
 
 
+@partial(jax.jit, donate_argnums=(2, 3))
+def store_kv_to_cache_compact_scatter(
+    key: jax.Array,
+    value: jax.Array,
+    k_cache: jax.Array,
+    v_cache: jax.Array,
+    slot_mapping: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Store K/V after compacting valid rows ahead of scatter.
+
+    This keeps invalid rows out of the hot portion of the scatter input while
+    preserving a static shape suitable for JIT. It remains internal and
+    experimental until GPU validation exists.
+    """
+    valid_mask = slot_mapping >= 0
+    num_tokens = slot_mapping.shape[0]
+    valid_positions = jnp.nonzero(valid_mask, size=num_tokens, fill_value=0)[0]
+    valid_count = jnp.sum(valid_mask.astype(jnp.int32))
+    compact_valid_mask = jnp.arange(num_tokens, dtype=jnp.int32) < valid_count
+
+    key_compact = key[valid_positions]
+    value_compact = value[valid_positions]
+    slot_compact = slot_mapping[valid_positions]
+
+    if key_compact.dtype != k_cache.dtype:
+        key_compact = key_compact.astype(k_cache.dtype)
+    if value_compact.dtype != v_cache.dtype:
+        value_compact = value_compact.astype(v_cache.dtype)
+
+    key_compact = jnp.where(compact_valid_mask[:, None, None], key_compact, 0)
+    value_compact = jnp.where(compact_valid_mask[:, None, None], value_compact, 0)
+    safe_slots = jnp.where(compact_valid_mask, slot_compact, k_cache.shape[0])
+
+    k_cache = k_cache.at[safe_slots].set(key_compact, mode="drop")
+    v_cache = v_cache.at[safe_slots].set(value_compact, mode="drop")
+
+    return k_cache, v_cache
+
+
+def _sorted_compact_slots(
+    slot_mapping: jax.Array,
+    invalid_slot: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    num_tokens = slot_mapping.shape[0]
+    valid_mask = slot_mapping >= 0
+    valid_positions = jnp.nonzero(valid_mask, size=num_tokens, fill_value=0)[0]
+    valid_count = jnp.sum(valid_mask.astype(jnp.int32))
+    compact_valid_mask = jnp.arange(num_tokens, dtype=jnp.int32) < valid_count
+    slot_compact = slot_mapping[valid_positions]
+    slot_compact = jnp.where(compact_valid_mask, slot_compact, invalid_slot)
+    sort_order = jnp.argsort(slot_compact, stable=True)
+    sorted_slots = slot_compact[sort_order]
+    sorted_valid_mask = sorted_slots < invalid_slot
+    return valid_positions, sort_order, sorted_valid_mask
+
+
+@partial(jax.jit, donate_argnums=(2, 3))
+def store_kv_to_cache_sorted_compact_scatter(
+    key: jax.Array,
+    value: jax.Array,
+    k_cache: jax.Array,
+    v_cache: jax.Array,
+    slot_mapping: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Store K/V after compacting valid rows and sorting target slots.
+
+    This keeps invalid rows out of the hot scatter path and presents writes in
+    slot order, which is a better approximation of a dedicated cache-update
+    operator than plain compaction while staying CPU-safe and JIT-friendly.
+    """
+    invalid_slot = k_cache.shape[0]
+    valid_positions, sort_order, sorted_valid_mask = _sorted_compact_slots(
+        slot_mapping,
+        invalid_slot,
+    )
+
+    key_sorted = key[valid_positions][sort_order]
+    value_sorted = value[valid_positions][sort_order]
+    slot_sorted = slot_mapping[valid_positions][sort_order]
+
+    if key_sorted.dtype != k_cache.dtype:
+        key_sorted = key_sorted.astype(k_cache.dtype)
+    if value_sorted.dtype != v_cache.dtype:
+        value_sorted = value_sorted.astype(v_cache.dtype)
+
+    key_sorted = jnp.where(sorted_valid_mask[:, None, None], key_sorted, 0)
+    value_sorted = jnp.where(sorted_valid_mask[:, None, None], value_sorted, 0)
+    safe_slots = jnp.where(sorted_valid_mask, slot_sorted, invalid_slot)
+
+    k_cache = k_cache.at[safe_slots].set(key_sorted, mode="drop")
+    v_cache = v_cache.at[safe_slots].set(value_sorted, mode="drop")
+    return k_cache, v_cache
+
+
 @partial(jax.jit, donate_argnums=(2, 3, 4, 5))
 def store_kv_to_cache_int8(
     key: jax.Array,
@@ -195,6 +320,187 @@ def store_kv_to_cache_int8(
     v_scale = v_scale.at[safe_slots].set(v_s, mode='drop')
 
     return k_cache, v_cache, k_scale, v_scale
+
+
+@partial(jax.jit, donate_argnums=(2, 3, 4, 5))
+def store_kv_to_cache_int8_compact_scatter(
+    key: jax.Array,
+    value: jax.Array,
+    k_cache: jax.Array,
+    v_cache: jax.Array,
+    k_scale: jax.Array,
+    v_scale: jax.Array,
+    slot_mapping: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """INT8 KV-cache store after compacting valid rows."""
+    valid_mask = slot_mapping >= 0
+    num_tokens = slot_mapping.shape[0]
+    valid_positions = jnp.nonzero(valid_mask, size=num_tokens, fill_value=0)[0]
+    valid_count = jnp.sum(valid_mask.astype(jnp.int32))
+    compact_valid_mask = jnp.arange(num_tokens, dtype=jnp.int32) < valid_count
+
+    key_compact = key[valid_positions]
+    value_compact = value[valid_positions]
+    slot_compact = slot_mapping[valid_positions]
+
+    key_compact = jnp.where(compact_valid_mask[:, None, None], key_compact, 0)
+    value_compact = jnp.where(compact_valid_mask[:, None, None], value_compact, 0)
+
+    k_q, k_s = quantize_kv_int8(key_compact)
+    v_q, v_s = quantize_kv_int8(value_compact)
+
+    safe_slots = jnp.where(compact_valid_mask, slot_compact, k_cache.shape[0])
+    k_cache = k_cache.at[safe_slots].set(k_q, mode="drop")
+    v_cache = v_cache.at[safe_slots].set(v_q, mode="drop")
+    k_scale = k_scale.at[safe_slots].set(k_s, mode="drop")
+    v_scale = v_scale.at[safe_slots].set(v_s, mode="drop")
+
+    return k_cache, v_cache, k_scale, v_scale
+
+
+@partial(jax.jit, donate_argnums=(2, 3, 4, 5))
+def store_kv_to_cache_int8_sorted_compact_scatter(
+    key: jax.Array,
+    value: jax.Array,
+    k_cache: jax.Array,
+    v_cache: jax.Array,
+    k_scale: jax.Array,
+    v_scale: jax.Array,
+    slot_mapping: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """INT8 KV-cache store after compaction plus slot ordering."""
+    invalid_slot = k_cache.shape[0]
+    valid_positions, sort_order, sorted_valid_mask = _sorted_compact_slots(
+        slot_mapping,
+        invalid_slot,
+    )
+
+    key_sorted = key[valid_positions][sort_order]
+    value_sorted = value[valid_positions][sort_order]
+    slot_sorted = slot_mapping[valid_positions][sort_order]
+
+    key_sorted = jnp.where(sorted_valid_mask[:, None, None], key_sorted, 0)
+    value_sorted = jnp.where(sorted_valid_mask[:, None, None], value_sorted, 0)
+
+    k_q, k_s = quantize_kv_int8(key_sorted)
+    v_q, v_s = quantize_kv_int8(value_sorted)
+
+    safe_slots = jnp.where(sorted_valid_mask, slot_sorted, invalid_slot)
+    k_cache = k_cache.at[safe_slots].set(k_q, mode="drop")
+    v_cache = v_cache.at[safe_slots].set(v_q, mode="drop")
+    k_scale = k_scale.at[safe_slots].set(k_s, mode="drop")
+    v_scale = v_scale.at[safe_slots].set(v_s, mode="drop")
+    return k_cache, v_cache, k_scale, v_scale
+
+
+def _tree_has_tracer(value) -> bool:
+    return any(
+        isinstance(leaf, jax_core.Tracer)
+        for leaf in jax.tree_util.tree_leaves(value)
+    )
+
+
+def _summarize_kv_update_slots(slot_mapping: jax.Array) -> tuple[int, int, int]:
+    """Return valid/skipped/duplicate slot counts for profiling diagnostics."""
+    slot_mapping_np = np.asarray(jax.device_get(slot_mapping))
+    valid_slots = slot_mapping_np[slot_mapping_np >= 0]
+    valid_tokens = int(valid_slots.size)
+    skipped_tokens = int(slot_mapping_np.size - valid_tokens)
+    duplicate_slots = int(valid_tokens - np.unique(valid_slots).size)
+    return valid_tokens, skipped_tokens, duplicate_slots
+
+
+def update_kv_cache(
+    key: jax.Array,
+    value: jax.Array,
+    k_cache: jax.Array,
+    v_cache: jax.Array,
+    slot_mapping: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Internal KV-cache update operator boundary.
+
+    The current default backend is the reference scatter implementation. The
+    indirection exists so a dedicated kernel can replace it later without
+    changing the attention layer call site.
+    """
+    backend = _active_kv_update_backend()
+
+    profiling_enabled = decode_step_profiling_enabled()
+    can_measure = profiling_enabled and not _tree_has_tracer(
+        (key, value, k_cache, v_cache, slot_mapping)
+    )
+    started_at = perf_counter() if can_measure else 0.0
+    if backend == "compact_scatter":
+        out = store_kv_to_cache_compact_scatter(
+            key, value, k_cache, v_cache, slot_mapping,
+        )
+    elif backend == "sorted_compact_scatter":
+        out = store_kv_to_cache_sorted_compact_scatter(
+            key, value, k_cache, v_cache, slot_mapping,
+        )
+    else:
+        out = store_kv_to_cache(key, value, k_cache, v_cache, slot_mapping)
+    if can_measure:
+        block_until_ready_tree(out)
+        valid_tokens, skipped_tokens, duplicate_slots = _summarize_kv_update_slots(
+            slot_mapping
+        )
+        record_kv_update_stats(
+            seconds=perf_counter() - started_at,
+            tokens=int(slot_mapping.shape[0]),
+            valid_tokens=valid_tokens,
+            skipped_tokens=skipped_tokens,
+            duplicate_slots=duplicate_slots,
+            backend=backend,
+            measured=True,
+        )
+    return out
+
+
+def update_kv_cache_int8(
+    key: jax.Array,
+    value: jax.Array,
+    k_cache: jax.Array,
+    v_cache: jax.Array,
+    k_scale: jax.Array,
+    v_scale: jax.Array,
+    slot_mapping: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Internal INT8 KV-cache update operator boundary."""
+    backend = _active_kv_update_backend()
+
+    profiling_enabled = decode_step_profiling_enabled()
+    can_measure = profiling_enabled and not _tree_has_tracer(
+        (key, value, k_cache, v_cache, k_scale, v_scale, slot_mapping)
+    )
+    started_at = perf_counter() if can_measure else 0.0
+    if backend == "compact_scatter":
+        out = store_kv_to_cache_int8_compact_scatter(
+            key, value, k_cache, v_cache, k_scale, v_scale, slot_mapping,
+        )
+    elif backend == "sorted_compact_scatter":
+        out = store_kv_to_cache_int8_sorted_compact_scatter(
+            key, value, k_cache, v_cache, k_scale, v_scale, slot_mapping,
+        )
+    else:
+        out = store_kv_to_cache_int8(
+            key, value, k_cache, v_cache, k_scale, v_scale, slot_mapping,
+        )
+    if can_measure:
+        block_until_ready_tree(out)
+        valid_tokens, skipped_tokens, duplicate_slots = _summarize_kv_update_slots(
+            slot_mapping
+        )
+        record_kv_update_stats(
+            seconds=perf_counter() - started_at,
+            tokens=int(slot_mapping.shape[0]),
+            valid_tokens=valid_tokens,
+            skipped_tokens=skipped_tokens,
+            duplicate_slots=duplicate_slots,
+            backend=backend,
+            measured=True,
+        )
+    return out
 
 
 def gather_kv_from_cache(
@@ -528,6 +834,7 @@ class Attention(nnx.Module):
                 context_lens=context.context_lens,
                 scale=self.scale,
                 block_size=self.block_size,
+                decode_schedule_token=context.decode_schedule_token,
             )
         
         # Fallback: Gather K/V from paged cache (slower path)
@@ -598,7 +905,7 @@ class Attention(nnx.Module):
             k_cache_flat = self.k_cache.reshape(cache_shape)
             v_cache_flat = self.v_cache.reshape(cache_shape)
 
-            k_cache_flat, v_cache_flat = store_kv_to_cache(
+            k_cache_flat, v_cache_flat = update_kv_cache(
                 k, v, k_cache_flat, v_cache_flat, context.slot_mapping,
             )
 

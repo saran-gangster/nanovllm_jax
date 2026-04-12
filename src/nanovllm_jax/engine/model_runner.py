@@ -13,6 +13,7 @@ Optimizations:
 
 import logging
 import os
+import time
 from dataclasses import dataclass
 # Disable x64 mode BEFORE importing jax for reduced memory bandwidth
 # This must be set before JAX is imported
@@ -31,6 +32,14 @@ if jax.config.jax_enable_x64:
     logger.warning("x64 mode is enabled; inference performance may be reduced")
 
 from nanovllm_jax.config import Config
+from nanovllm_jax.engine.decode_schedule import (
+    DecodeScheduleDeviceView,
+    DecodeScheduleHostView,
+    DecodeSchedulePacket,
+    allocate_decode_schedule_token,
+    register_decode_schedule_packet,
+    unregister_decode_schedule_packet,
+)
 from nanovllm_jax.engine.sequence import Sequence
 from nanovllm_jax.layers.sampler import Sampler
 from nanovllm_jax.layers.attention import configure_prefill_backend
@@ -40,6 +49,16 @@ from nanovllm_jax.layers.paged_attention import (
 )
 from nanovllm_jax.utils.context import AttentionContext, create_prefill_context, create_decode_context
 from nanovllm_jax.utils.parallel import create_tp_mesh
+from nanovllm_jax.utils.runtime_diagnostics import (
+    append_decode_schedule_record,
+    block_until_ready_tree,
+    consume_partitioned_decode_reduction_stats,
+    consume_kv_update_stats,
+    decode_schedule_dump_enabled,
+    decode_step_profiling_enabled,
+    reset_partitioned_decode_reduction_stats,
+    reset_kv_update_stats,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from nanovllm_jax.models.qwen3 import Qwen3ForCausalLM
@@ -65,7 +84,14 @@ class DecodeRuntimeCache:
     positions: np.ndarray
     slot_mapping: np.ndarray
     context_lens: np.ndarray
+    input_ids_jax: jax.Array | None
+    positions_jax: jax.Array | None
+    slot_mapping_jax: jax.Array | None
+    context_lens_jax: jax.Array | None
+    block_tables_host: np.ndarray | None
     block_tables_jax: jax.Array | None
+    schedule_packet: DecodeSchedulePacket | None
+    sequence_ids: tuple[int, ...]
 
 
 class ModelRunner:
@@ -110,8 +136,12 @@ class ModelRunner:
         configure_prefill_backend(config)
 
         self.block_size = config.kvcache_block_size
+        self._decode_schedule_token = allocate_decode_schedule_token()
         self._decode_runtime_cache: DecodeRuntimeCache | None = None
         self._prefill_runtime_cache: PrefillRuntimeCache | None = None
+        self._last_decode_profile: dict | None = None
+        self._last_decode_prepare_stats: dict | None = None
+        self._last_decode_schedule_action: str | None = None
         self._prefill_pos_template = np.arange(
             max(1, config.max_model_len), dtype=np.int32,
         )
@@ -165,6 +195,124 @@ class ModelRunner:
         self._warmup_model()
         
         logger.info("Model runner initialized")
+
+    def _ensure_decode_schedule_token(self) -> int:
+        token = getattr(self, "_decode_schedule_token", 0)
+        if not token:
+            token = allocate_decode_schedule_token()
+            self._decode_schedule_token = token
+        return token
+
+    def _update_decode_input_device_arrays(
+        self,
+        cache: DecodeRuntimeCache,
+        *,
+        real_batch_size: int,
+        batch_size: int,
+        same_membership: bool,
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, str]:
+        """Materialize decode input arrays with cheap device-side patching when possible."""
+        if (
+            cache.input_ids_jax is None
+            or cache.positions_jax is None
+            or cache.slot_mapping_jax is None
+            or cache.context_lens_jax is None
+        ):
+            cache.input_ids_jax = jnp.asarray(cache.input_ids)
+            cache.positions_jax = jnp.asarray(cache.positions)
+            cache.slot_mapping_jax = jnp.asarray(cache.slot_mapping)
+            cache.context_lens_jax = jnp.asarray(cache.context_lens)
+            return (
+                cache.input_ids_jax,
+                cache.positions_jax,
+                cache.slot_mapping_jax,
+                cache.context_lens_jax,
+                "full_transfer",
+            )
+
+        active_slice = slice(0, real_batch_size)
+        input_ids = cache.input_ids_jax.at[active_slice].set(
+            jnp.asarray(cache.input_ids[active_slice])
+        )
+        positions = cache.positions_jax.at[active_slice].set(
+            jnp.asarray(cache.positions[active_slice])
+        )
+        slot_mapping = cache.slot_mapping_jax.at[active_slice].set(
+            jnp.asarray(cache.slot_mapping[active_slice])
+        )
+        context_lens = cache.context_lens_jax.at[active_slice].set(
+            jnp.asarray(cache.context_lens[active_slice])
+        )
+
+        if real_batch_size < batch_size:
+            tail = slice(real_batch_size, batch_size)
+            input_ids = input_ids.at[tail].set(0)
+            positions = positions.at[tail].set(0)
+            slot_mapping = slot_mapping.at[tail].set(-1)
+            context_lens = context_lens.at[tail].set(1)
+
+        cache.input_ids_jax = input_ids
+        cache.positions_jax = positions
+        cache.slot_mapping_jax = slot_mapping
+        cache.context_lens_jax = context_lens
+        action = "patch_active_rows" if same_membership else "patch_rows_membership_changed"
+        return input_ids, positions, slot_mapping, context_lens, action
+
+    def _update_decode_block_tables(
+        self,
+        cache: DecodeRuntimeCache,
+        seqs: list[Sequence],
+        *,
+        batch_size: int,
+        block_tables_dirty: bool,
+    ) -> tuple[jax.Array, str, int]:
+        """Update cached block tables with row-wise host/device patching when possible."""
+        max_len = self.max_blocks_per_seq
+        host = cache.block_tables_host
+        full_rebuild_required = False
+        if host is None or host.shape != (batch_size, max_len):
+            host = np.full((batch_size, max_len), -1, dtype=np.int32)
+            cache.block_tables_host = host
+            cache.block_tables_jax = None
+            full_rebuild_required = True
+
+        if not block_tables_dirty and cache.block_tables_jax is not None:
+            return cache.block_tables_jax, "reuse_block_tables", 0
+
+        changed_rows: list[int] = []
+        for row_idx, seq in enumerate(seqs):
+            row = host[row_idx]
+            row_len = len(seq.block_table)
+            row_changed = (
+                row_len > 0 and not np.array_equal(row[:row_len], np.asarray(seq.block_table, dtype=np.int32))
+            ) or np.any(row[row_len:] != -1)
+            if row_changed:
+                row.fill(-1)
+                if row_len:
+                    row[:row_len] = seq.block_table
+                changed_rows.append(row_idx)
+
+        for row_idx in range(len(seqs), batch_size):
+            row = host[row_idx]
+            if np.any(row != -1):
+                row.fill(-1)
+                changed_rows.append(row_idx)
+
+        if cache.block_tables_jax is None or full_rebuild_required:
+            block_tables = jnp.asarray(host)
+            cache.block_tables_jax = block_tables
+            return block_tables, "full_block_table_transfer", len(changed_rows)
+
+        if not changed_rows:
+            return cache.block_tables_jax, "reuse_block_tables", 0
+
+        changed_rows_np = host[changed_rows].copy()
+        row_indices = jnp.asarray(np.asarray(changed_rows, dtype=np.int32))
+        block_tables = cache.block_tables_jax.at[row_indices].set(
+            jnp.asarray(changed_rows_np)
+        )
+        cache.block_tables_jax = block_tables
+        return block_tables, "patch_block_table_rows", len(changed_rows)
     
     def _warmup_model(self):
         """Run a warmup pass to trigger lazy initialization."""
@@ -482,6 +630,7 @@ class ModelRunner:
         """
         real_batch_size = len(seqs)
         batch_size = self._bucket_decode_batch_size(real_batch_size)
+        seq_ids = tuple(seq.seq_id for seq in seqs)
 
         # Reuse pre-allocated NumPy arrays when the bucket hasn't changed.
         cache = self._decode_runtime_cache
@@ -492,7 +641,14 @@ class ModelRunner:
                 positions=np.zeros(batch_size, dtype=np.int32),
                 slot_mapping=np.full(batch_size, -1, dtype=np.int32),
                 context_lens=np.ones(batch_size, dtype=np.int32),
+                input_ids_jax=None,
+                positions_jax=None,
+                slot_mapping_jax=None,
+                context_lens_jax=None,
+                block_tables_host=None,
                 block_tables_jax=None,
+                schedule_packet=None,
+                sequence_ids=(),
             )
             self._decode_runtime_cache = cache
             block_tables_dirty = True
@@ -531,22 +687,109 @@ class ModelRunner:
             np_context_lens[real_batch_size:] = 1
             np_slot_mapping[real_batch_size:] = -1
 
-        # Convert to JAX arrays (single transfer)
-        input_ids = jnp.asarray(np_input_ids)
-        positions = jnp.asarray(np_positions)
-        slot_mapping = jnp.asarray(np_slot_mapping)
-        context_lens = jnp.asarray(np_context_lens)
+        same_membership = seq_ids == cache.sequence_ids
+        (
+            input_ids,
+            positions,
+            slot_mapping,
+            context_lens,
+            decode_input_action,
+        ) = self._update_decode_input_device_arrays(
+            cache,
+            real_batch_size=real_batch_size,
+            batch_size=batch_size,
+            same_membership=same_membership,
+        )
+        block_tables, block_table_action, block_table_rows_changed = (
+            self._update_decode_block_tables(
+                cache,
+                seqs,
+                batch_size=batch_size,
+                block_tables_dirty=block_tables_dirty,
+            )
+        )
+        cache.sequence_ids = seq_ids
 
-        if block_tables_dirty or cache.block_tables_jax is None:
-            block_tables = self._prepare_block_tables(seqs, batch_size=batch_size)
-            cache.block_tables_jax = block_tables
-        else:
-            block_tables = cache.block_tables_jax
+        schedule_packet = cache.schedule_packet
+        if schedule_packet is None:
+            schedule_packet = DecodeSchedulePacket(
+                token=self._ensure_decode_schedule_token(),
+            )
+            cache.schedule_packet = schedule_packet
+
+        schedule_action = schedule_packet.refresh(
+            real_batch_size=real_batch_size,
+            padded_batch_size=batch_size,
+            block_size=self.block_size,
+            block_tables_dirty=block_tables_dirty,
+            sequence_ids=seq_ids,
+            same_membership=same_membership,
+            decode_input_action=decode_input_action,
+            block_table_action=block_table_action,
+            block_table_rows_changed=block_table_rows_changed,
+            host_view=DecodeScheduleHostView(
+                input_ids=cache.input_ids,
+                positions=cache.positions,
+                slot_mapping=cache.slot_mapping,
+                context_lens=cache.context_lens,
+                block_tables=cache.block_tables_host,
+            ),
+            device_view=DecodeScheduleDeviceView(
+                input_ids=input_ids,
+                positions=positions,
+                slot_mapping=slot_mapping,
+                context_lens=context_lens,
+                block_tables=block_tables,
+            ),
+        )
+        register_decode_schedule_packet(schedule_packet)
+        self._last_decode_schedule_action = schedule_action
+        self._last_decode_prepare_stats = {
+            "real_batch_size": real_batch_size,
+            "padded_batch_size": batch_size,
+            "sequence_membership_unchanged": same_membership,
+            "decode_input_action": decode_input_action,
+            "block_table_action": block_table_action,
+            "block_table_rows_changed": block_table_rows_changed,
+            "decode_schedule_action": schedule_action,
+            "prepared_metadata_action": schedule_packet.last_prepared_metadata_action,
+            "prepared_metadata_entries_before": (
+                schedule_packet.last_prepared_metadata_entries_before
+            ),
+            "prepared_metadata_entries_after": (
+                schedule_packet.last_prepared_metadata_entries_after
+            ),
+        }
+
+        if decode_schedule_dump_enabled():
+            append_decode_schedule_record(
+                {
+                    "event": "decode_schedule_refresh",
+                    "action": schedule_action,
+                    "real_batch_size": real_batch_size,
+                    "padded_batch_size": batch_size,
+                    "block_size": self.block_size,
+                    "block_tables_dirty": bool(block_tables_dirty),
+                    "decode_schedule_token": schedule_packet.token,
+                    "sequence_membership_unchanged": same_membership,
+                    "decode_input_action": decode_input_action,
+                    "block_table_action": block_table_action,
+                    "block_table_rows_changed": block_table_rows_changed,
+                    "prepared_metadata_action": (
+                        schedule_packet.last_prepared_metadata_action
+                    ),
+                    "prepared_metadata_entries_before": (
+                        schedule_packet.last_prepared_metadata_entries_before
+                    ),
+                    "prepared_metadata_entries": schedule_packet.prepared_metadata_entries,
+                }
+            )
 
         context = create_decode_context(
             context_lens=context_lens,
             slot_mapping=slot_mapping,
             block_tables=block_tables,
+            decode_schedule_token=schedule_packet.token,
         )
 
         return input_ids, positions, context
@@ -624,18 +867,85 @@ class ModelRunner:
             List of sampled token IDs (only on rank 0 for TP).
         """
         real_batch_size = len(seqs)
+        self._last_decode_profile = None
+        self._last_decode_prepare_stats = None
 
         # Prepare inputs
         if is_prefill:
             input_ids, positions, context = self._prepare_prefill(seqs)
         else:
+            profile_enabled = decode_step_profiling_enabled()
+            prepare_started_at = time.perf_counter() if profile_enabled else 0.0
             input_ids, positions, context = self._prepare_decode(
                 seqs, block_tables_dirty=block_tables_dirty,
             )
+            if profile_enabled:
+                self._last_decode_profile = {
+                    "phase": "decode",
+                    "real_batch_size": real_batch_size,
+                    "padded_batch_size": int(input_ids.shape[0]),
+                    "prepare_decode_s": time.perf_counter() - prepare_started_at,
+                    "decode_schedule_action": self._last_decode_schedule_action,
+                }
+                if self._last_decode_prepare_stats is not None:
+                    self._last_decode_profile.update(self._last_decode_prepare_stats)
+                reset_kv_update_stats()
+                reset_partitioned_decode_reduction_stats()
+        profile_enabled = bool(self._last_decode_profile is not None)
         
-        # Prepare sampling
         # Run model
+        model_started_at = time.perf_counter() if profile_enabled else 0.0
         logits = self._run_model(input_ids, positions, context, is_prefill)
+        if profile_enabled:
+            block_until_ready_tree(logits)
+            assert self._last_decode_profile is not None
+            self._last_decode_profile["model_execute_s"] = (
+                time.perf_counter() - model_started_at
+            )
+
+            kv_update_stats = consume_kv_update_stats()
+            self._last_decode_profile["kv_update_s"] = (
+                kv_update_stats["seconds"] if kv_update_stats["measured"] else None
+            )
+            self._last_decode_profile["kv_update_calls"] = kv_update_stats["calls"]
+            self._last_decode_profile["kv_update_tokens"] = kv_update_stats["tokens"]
+            self._last_decode_profile["kv_update_valid_tokens"] = (
+                kv_update_stats["valid_tokens"]
+            )
+            self._last_decode_profile["kv_update_skipped_tokens"] = (
+                kv_update_stats["skipped_tokens"]
+            )
+            self._last_decode_profile["kv_update_duplicate_slots"] = (
+                kv_update_stats["duplicate_slots"]
+            )
+            self._last_decode_profile["kv_update_backend"] = (
+                kv_update_stats["backend"]
+                or os.environ.get("NANOVLLM_JAX_KV_UPDATE_BACKEND", "scatter")
+                .strip()
+                .lower()
+            )
+            self._last_decode_profile["kv_update_measured"] = bool(
+                kv_update_stats["measured"]
+            )
+            reduction_stats = consume_partitioned_decode_reduction_stats()
+            self._last_decode_profile["partitioned_decode_reduction_s"] = (
+                reduction_stats["seconds"] if reduction_stats["measured"] else None
+            )
+            self._last_decode_profile["partitioned_decode_reduction_calls"] = (
+                reduction_stats["calls"]
+            )
+            self._last_decode_profile["partitioned_decode_reduction_backend"] = (
+                reduction_stats["backend"]
+            )
+            self._last_decode_profile["partitioned_decode_reduction_family"] = (
+                reduction_stats["family"]
+            )
+            self._last_decode_profile["partitioned_decode_reduction_max_splits"] = (
+                reduction_stats["max_splits"]
+            )
+            self._last_decode_profile["partitioned_decode_reduction_measured"] = bool(
+                reduction_stats["measured"]
+            )
 
         # Prepare sampling (pad to bucketed batch size when needed).
         temperatures = (
@@ -646,7 +956,14 @@ class ModelRunner:
         
         # Sample tokens (only on rank 0)
         if self.tp_rank == 0 and logits is not None:
+            sample_started_at = time.perf_counter() if profile_enabled else 0.0
             token_ids = self.sampler(logits, temperatures)
+            if profile_enabled:
+                block_until_ready_tree(token_ids)
+                assert self._last_decode_profile is not None
+                self._last_decode_profile["sampler_s"] = (
+                    time.perf_counter() - sample_started_at
+                )
             # Slice away padded rows.
             if token_ids.shape[0] != real_batch_size:
                 token_ids = token_ids[:real_batch_size]
@@ -659,5 +976,19 @@ class ModelRunner:
         """Cleanup resources."""
         # JAX handles cleanup automatically, but we can explicitly delete
         # large arrays if needed
-        del self.kv_cache
-        del self.model
+        unregister_decode_schedule_packet(getattr(self, "_decode_schedule_token", 0))
+        cache = getattr(self, "_decode_runtime_cache", None)
+        if cache is not None:
+            cache.schedule_packet = None
+        self._decode_schedule_token = 0
+        self._last_decode_schedule_action = None
+        self._last_decode_prepare_stats = None
+        if hasattr(self, "kv_cache"):
+            del self.kv_cache
+        if hasattr(self, "model"):
+            del self.model
+
+    def consume_last_decode_profile(self) -> dict | None:
+        profile = self._last_decode_profile
+        self._last_decode_profile = None
+        return profile

@@ -82,3 +82,12 @@ More detail: [ARCHITECTURE.md](ARCHITECTURE.md)
 ## Benchmarks
 
 - Quick: `python bench_jax.py`
+- Decode diagnostics artifact run:
+  `python profile_decode_runtime.py --model /YOUR/MODEL/PATH --output-dir ./decode_profile_out`
+  Writes both `decode_runtime_profile_summary.json` and `run_manifest.json`.
+- Decode diagnostics with an internal KV-update A/B override:
+  `python profile_decode_runtime.py --model /YOUR/MODEL/PATH --output-dir ./decode_profile_out --kv-update-backend sorted_compact_scatter`
+- Decode diagnostics summary diff:
+  `python compare_decode_profiles.py --before ./run_a/decode_runtime_profile_summary.json --after ./run_b/decode_runtime_profile_summary.json`
+- Decode diagnostics multi-run timing summary:
+  `python summarize_decode_profiles.py ./run_a/decode_runtime_profile_summary.json ./run_b/decode_runtime_profile_summary.json`

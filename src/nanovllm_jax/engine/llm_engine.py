@@ -17,6 +17,10 @@ from nanovllm_jax.sampling_params import SamplingParams
 from nanovllm_jax.engine.sequence import Sequence
 from nanovllm_jax.engine.scheduler import Scheduler
 from nanovllm_jax.engine.model_runner import ModelRunner
+from nanovllm_jax.utils.runtime_diagnostics import (
+    append_decode_step_record,
+    decode_step_profiling_enabled,
+)
 
 
 class LLMEngine:
@@ -98,8 +102,12 @@ class LLMEngine:
             - List of (seq_id, completion_tokens) for finished sequences
             - Number of tokens processed (positive for prefill, negative for decode)
         """
+        profile_enabled = decode_step_profiling_enabled()
+
         # Schedule batch
+        schedule_started_at = perf_counter() if profile_enabled else 0.0
         seqs, is_prefill = self.scheduler.schedule()
+        scheduler_s = perf_counter() - schedule_started_at if profile_enabled else None
 
         # Pass block_tables_dirty hint to avoid rebuilding block tables
         # when no new blocks were allocated since the last decode step.
@@ -110,7 +118,9 @@ class LLMEngine:
         token_ids = self.model_runner.run(seqs, is_prefill, block_tables_dirty=bt_dirty)
 
         # Process outputs
+        postprocess_started_at = perf_counter() if profile_enabled else 0.0
         self.scheduler.postprocess(seqs, token_ids)
+        postprocess_s = perf_counter() - postprocess_started_at if profile_enabled else None
         
         # Collect finished sequences
         outputs = [
@@ -120,6 +130,20 @@ class LLMEngine:
         
         # Token count (positive for prefill, negative for decode)
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
+
+        if profile_enabled and not is_prefill:
+            record = self.model_runner.consume_last_decode_profile() or {}
+            record.update(
+                {
+                    "event": "decode_step_profile",
+                    "scheduled_batch_size": len(seqs),
+                    "block_tables_dirty": bool(bt_dirty),
+                    "scheduler_s": scheduler_s,
+                    "postprocess_s": postprocess_s,
+                    "num_tokens_delta": num_tokens,
+                }
+            )
+            append_decode_step_record(record)
         
         return outputs, num_tokens
     

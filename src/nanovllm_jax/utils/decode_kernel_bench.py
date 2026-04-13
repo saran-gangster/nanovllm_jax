@@ -19,6 +19,7 @@ from nanovllm_jax.utils.decode_profile_artifacts import (
 _BOOL_TRUE = {"true", "yes", "on"}
 _BOOL_FALSE = {"false", "no", "off"}
 _BOOLEAN_OPTIONAL_ARGS = {"use_schedule_barrier"}
+_ENV_CASE_PREFIX = "env__"
 
 
 def _coerce_case_value(raw: str) -> Any:
@@ -58,6 +59,22 @@ def parse_case_spec(spec: str) -> dict[str, Any]:
     return parsed
 
 
+def extract_case_env(case: dict[str, Any]) -> dict[str, str]:
+    """Extract environment overrides from ``env__FOO=...`` case entries."""
+    env: dict[str, str] = {}
+    for key, value in case.items():
+        if not key.startswith(_ENV_CASE_PREFIX):
+            continue
+        env_key = key[len(_ENV_CASE_PREFIX) :]
+        if not env_key:
+            continue
+        if isinstance(value, bool):
+            env[env_key] = "1" if value else "0"
+        else:
+            env[env_key] = str(value)
+    return env
+
+
 def build_worker_command(
     *,
     repo_root: str | os.PathLike[str],
@@ -73,7 +90,13 @@ def build_worker_command(
     script_path = str(Path(repo_root) / "bench_decode_families.py")
     command = [sys.executable, script_path]
     merged = dict(common_args)
-    merged.update({key: value for key, value in case.items() if key not in {"name"}})
+    merged.update(
+        {
+            key: value
+            for key, value in case.items()
+            if key not in {"name"} and not key.startswith(_ENV_CASE_PREFIX)
+        }
+    )
     merged["output_json"] = str(output_json)
     merged["warmup"] = warmup
     merged["iters"] = iters

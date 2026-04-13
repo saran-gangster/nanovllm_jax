@@ -57,7 +57,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mosaic-kernel-family",
-        choices=("auto", "baseline", "latency", "throughput"),
+        choices=("auto", "baseline", "latency", "throughput", "throughput_v2"),
         help="Internal Mosaic family override for controlled profiling.",
     )
     parser.add_argument(

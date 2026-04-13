@@ -64,6 +64,20 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def _serialize_output_records(outputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for index, output in enumerate(outputs):
+        token_ids = [int(token) for token in output.get("token_ids", [])]
+        records.append(
+            {
+                "index": int(index),
+                "token_ids": token_ids,
+                "text": str(output.get("text", "")),
+            }
+        )
+    return records
+
+
 def _count_by(records: list[dict[str, Any]], key: str) -> dict[str, int]:
     counts: dict[str, int] = {}
     for record in records:
@@ -625,6 +639,7 @@ def run_controlled_decode_profile(
     mosaic_min_decode_batch: int | None = None,
     mosaic_throughput_min_decode_batch: int | None = None,
     enforce_eager: bool = False,
+    extra_env_overrides: dict[str, str] | None = None,
     invocation: dict[str, Any] | None = None,
     llm_kwargs: dict[str, Any] | None = None,
     llm_class=None,
@@ -674,6 +689,10 @@ def run_controlled_decode_profile(
     if mosaic_throughput_min_decode_batch is not None:
         env_overrides["NANOVLLM_JAX_INTERNAL_MOSAIC_THROUGHPUT_MIN_DECODE_BATCH"] = str(
             int(mosaic_throughput_min_decode_batch)
+        )
+    if extra_env_overrides is not None:
+        env_overrides.update(
+            {str(key): str(value) for key, value in extra_env_overrides.items()}
         )
 
     outputs = []
@@ -755,6 +774,7 @@ def run_controlled_decode_profile(
         "outputs": {
             "count": len(outputs),
             "token_counts": [len(output.get("token_ids", [])) for output in outputs],
+            "records": _serialize_output_records(outputs),
         },
         "artifacts": {
             "decode_step_profile_path": str(decode_step_path),

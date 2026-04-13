@@ -212,6 +212,12 @@ class DummyNoArtifactsLLM:
         self.exited = True
 
 
+class EnvAwareNoArtifactsLLM(DummyNoArtifactsLLM):
+    def generate(self, prompts, sampling_params, use_tqdm=False):
+        assert os.environ.get("NANOVLLM_JAX_ENABLE_THROUGHPUT_V2_MOSAIC") == "1"
+        return super().generate(prompts, sampling_params, use_tqdm=use_tqdm)
+
+
 class DummySparseArtifactsLLM:
     instances = []
 
@@ -294,6 +300,10 @@ def test_run_controlled_decode_profile_writes_stable_summary(tmp_path: Path, mon
     assert payload["prompts"]["count"] == 2
     assert payload["outputs"]["count"] == 2
     assert payload["outputs"]["token_counts"] == [3, 3]
+    assert payload["outputs"]["records"] == [
+        {"index": 0, "text": "", "token_ids": [1, 2, 3]},
+        {"index": 1, "text": "", "token_ids": [1, 2, 3]},
+    ]
     assert payload["artifacts"]["decode_step_records"] == 2
     assert payload["artifacts"]["decode_schedule_records"] == 1
     assert payload["artifacts"]["run_manifest_path"] == str(manifest_path)
@@ -379,6 +389,9 @@ def test_run_controlled_decode_profile_handles_missing_artifacts_and_default_run
     assert summary["runtime"]["mosaic_min_decode_batch"] == "default"
     assert summary["runtime"]["mosaic_throughput_min_decode_batch"] == "default"
     assert summary["runtime"]["enforce_eager"] is False
+    assert summary["outputs"]["records"] == [
+        {"index": 0, "text": "", "token_ids": [1]},
+    ]
     assert summary["artifacts"]["decode_step_records"] == 0
     assert summary["artifacts"]["decode_schedule_records"] == 0
     assert summary["histograms"]["decode_input_actions"] == {}
@@ -431,6 +444,39 @@ def test_run_controlled_decode_profile_handles_empty_and_sparse_artifacts(
         0.002
     )
     assert DummySparseArtifactsLLM.instances[-1].exited is True
+
+
+def test_run_controlled_decode_profile_merges_extra_env_overrides(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    output_dir = tmp_path / "artifacts"
+
+    monkeypatch.delenv("NANOVLLM_JAX_PROFILE_DECODE_STEP", raising=False)
+    monkeypatch.delenv("NANOVLLM_JAX_DUMP_DECODE_SCHEDULE", raising=False)
+    monkeypatch.delenv("NANOVLLM_JAX_DIAGNOSTICS_DIR", raising=False)
+    EnvAwareNoArtifactsLLM.instances.clear()
+
+    summary = run_controlled_decode_profile(
+        model_path=model_dir,
+        output_dir=output_dir,
+        prompts=["a"],
+        max_tokens=4,
+        temperature=0.0,
+        extra_env_overrides={
+            "NANOVLLM_JAX_ENABLE_THROUGHPUT_V2_MOSAIC": "1",
+        },
+        llm_class=EnvAwareNoArtifactsLLM,
+        sampling_params_cls=DummySamplingParams,
+    )
+
+    assert summary["manifest"]["env"]["NANOVLLM_JAX_ENABLE_THROUGHPUT_V2_MOSAIC"] == "1"
+    assert summary["outputs"]["records"] == [
+        {"index": 0, "text": "", "token_ids": [1]},
+    ]
+    assert EnvAwareNoArtifactsLLM.instances[-1].exited is True
 
 
 def test_run_kv_update_backend_matrix_writes_comparisons(tmp_path: Path, monkeypatch) -> None:

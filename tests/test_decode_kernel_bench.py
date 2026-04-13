@@ -6,6 +6,7 @@ from pathlib import Path
 from nanovllm_jax.utils.decode_kernel_bench import (
     build_worker_command,
     compare_kernel_benchmark_summaries,
+    extract_case_env,
     parse_case_spec,
     summarize_kernel_case_runs,
 )
@@ -94,6 +95,43 @@ def test_build_worker_command_emits_boolean_optional_false_flag(tmp_path: Path) 
 
     assert "--no-use-schedule-barrier" in command
     assert "--use-schedule-barrier" not in command
+
+
+def test_extract_case_env_and_omit_from_worker_command(tmp_path: Path) -> None:
+    case = {
+        "name": "throughput_v2_mosaic",
+        "family": "throughput_v2",
+        "env__NANOVLLM_JAX_ENABLE_THROUGHPUT_V2_MOSAIC": 1,
+        "env__NANOVLLM_JAX_MOSAIC_DECODE_KERNEL": "throughput_v2",
+        "block_q": 64,
+    }
+
+    env = extract_case_env(case)
+    command = build_worker_command(
+        repo_root="/repo",
+        common_args={
+            "batch_size": 512,
+            "num_heads": 16,
+            "num_kv_heads": 8,
+            "head_dim": 128,
+            "block_size": 256,
+            "max_blocks_per_seq": 16,
+            "num_blocks": 4096,
+            "dtype": "bfloat16",
+            "seed": 0,
+        },
+        case=case,
+        output_json=tmp_path / "out.json",
+        warmup=5,
+        iters=20,
+    )
+
+    assert env == {
+        "NANOVLLM_JAX_ENABLE_THROUGHPUT_V2_MOSAIC": "1",
+        "NANOVLLM_JAX_MOSAIC_DECODE_KERNEL": "throughput_v2",
+    }
+    assert "--env--nanovllm-jax-enable-throughput-v2-mosaic" not in command
+    assert "--env--nanovllm-jax-mosaic-decode-kernel" not in command
 
 
 def test_summarize_and_compare_kernel_case_runs(tmp_path: Path) -> None:

@@ -116,7 +116,7 @@ def test_select_mosaic_decode_variant_auto_policy() -> None:
     ) == "latency"
 
 
-def test_select_mosaic_decode_variant_auto_policy_prefers_throughput_v2_when_enabled(monkeypatch) -> None:
+def test_select_mosaic_decode_variant_canary_table_prefers_throughput_v2_when_enabled(monkeypatch) -> None:
     pa._MOSAIC_DECODE_FAMILY_TABLE = {}
     _dispatch_state().variant_selection_cache.clear()
     monkeypatch.setattr(pa, "mosaic_attn", SimpleNamespace(
@@ -130,6 +130,22 @@ def test_select_mosaic_decode_variant_auto_policy_prefers_throughput_v2_when_ena
         max_blocks_per_seq=16,
         block_size=256,
     ) == "throughput_v2"
+
+
+def test_select_mosaic_decode_variant_canary_table_does_not_expand_past_validated_shapes(monkeypatch) -> None:
+    pa._MOSAIC_DECODE_FAMILY_TABLE = {}
+    _dispatch_state().variant_selection_cache.clear()
+    monkeypatch.setattr(pa, "mosaic_attn", SimpleNamespace(
+        _should_use_throughput_v2_mosaic_kernel=lambda: True,
+    ))
+
+    assert pa._select_mosaic_decode_variant(
+        requested_variant="auto",
+        padded_batch=512,
+        head_dim=128,
+        max_blocks_per_seq=48,
+        block_size=256,
+    ) == "throughput"
 
 
 def test_select_mosaic_decode_variant_table_override_and_fallback() -> None:

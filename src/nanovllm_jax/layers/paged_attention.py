@@ -146,6 +146,14 @@ _MOSAIC_DECODE_FAMILY_TABLE_PATH = (
 _MOSAIC_DECODE_FAMILY_TABLE: dict[tuple[int, int, int, int], str] | None = None
 _MOSAIC_VARIANT_SELECTION_CACHE_MAX = 256
 _MOSAIC_DECODE_FAILURE_CACHE_MAX = 256
+_THROUGHPUT_V2_CANARY_SHAPE_TABLE: dict[tuple[int, int, int, int], str] = {
+    (512, 128, 16, 256): "throughput_v2",
+    (512, 128, 32, 256): "throughput_v2",
+    (512, 128, 64, 256): "throughput_v2",
+    (1024, 128, 16, 256): "throughput_v2",
+    (2048, 128, 16, 256): "throughput_v2",
+    (4096, 128, 16, 256): "throughput_v2",
+}
 
 
 def _normalize_mosaic_variant(raw: object) -> str:
@@ -203,9 +211,20 @@ def _lookup_mosaic_variant_table(
     shape_key: tuple[int, int, int, int],
 ) -> str | None:
     _load_mosaic_variant_table_if_needed()
-    if _MOSAIC_DECODE_FAMILY_TABLE is None:
-        return None
-    return _MOSAIC_DECODE_FAMILY_TABLE.get(shape_key)
+    if _MOSAIC_DECODE_FAMILY_TABLE is not None:
+        override = _MOSAIC_DECODE_FAMILY_TABLE.get(shape_key)
+        if override is not None:
+            return override
+    if (
+        mosaic_attn is not None
+        and getattr(
+            mosaic_attn,
+            "_should_use_throughput_v2_mosaic_kernel",
+            lambda: False,
+        )()
+    ):
+        return _THROUGHPUT_V2_CANARY_SHAPE_TABLE.get(shape_key)
+    return None
 
 
 def _heuristic_mosaic_variant(
@@ -214,18 +233,6 @@ def _heuristic_mosaic_variant(
     head_dim: int,
     max_blocks_per_seq: int,
 ) -> str:
-    if (
-        mosaic_attn is not None
-        and getattr(
-            mosaic_attn,
-            "_should_use_throughput_v2_mosaic_kernel",
-            lambda: False,
-        )()
-        and head_dim >= 128
-        and padded_batch >= 512
-        and max_blocks_per_seq >= 16
-    ):
-        return "throughput_v2"
     if max_blocks_per_seq >= 32 and padded_batch >= 512:
         return "throughput"
     if max_blocks_per_seq == 24 and padded_batch >= 256:

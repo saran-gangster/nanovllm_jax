@@ -12,6 +12,7 @@ from nanovllm_jax.utils.decode_kernel_bench import (
     build_kernel_benchmark_manifest,
     build_worker_command,
     compare_kernel_benchmark_summaries,
+    extract_case_env,
     now_utc_iso,
     parse_case_spec,
     run_worker_command,
@@ -103,7 +104,11 @@ def _run_pass(
                 verify_against_blockwise=verify_against_blockwise,
             )
             commands.append(command)
-            run_worker_command(command, repo_root=repo_root)
+            run_worker_command(
+                command,
+                repo_root=repo_root,
+                extra_env=extract_case_env(case),
+            )
             run_paths.append(str(run_path))
 
         summary = summarize_kernel_case_runs(

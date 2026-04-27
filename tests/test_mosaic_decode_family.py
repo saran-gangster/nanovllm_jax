@@ -168,14 +168,14 @@ def test_select_mosaic_decode_variant_canary_table_does_not_expand_past_validate
 
     assert pa._select_mosaic_decode_variant(
         requested_variant="auto",
-        padded_batch=512,
+        padded_batch=1024,
         head_dim=128,
-        max_blocks_per_seq=48,
+        max_blocks_per_seq=24,
         block_size=256,
         num_heads=16,
         num_kv_heads=8,
         dtype="bfloat16",
-    ) == "throughput"
+    ) == "baseline"
 
 
 def test_select_mosaic_decode_variant_table_override_and_fallback() -> None:

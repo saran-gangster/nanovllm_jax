@@ -80,7 +80,7 @@ def build_canary_kernel_table(
     *,
     family: str = "throughput_v2",
 ) -> dict[str, str]:
-    resolved_rows = list(PRIMARY_PROMOTION_ROWS if rows is None else rows)
+    resolved_rows = list(EXTENDED_PROMOTION_ROWS if rows is None else rows)
     return {row.table_key: str(family) for row in resolved_rows}
 
 

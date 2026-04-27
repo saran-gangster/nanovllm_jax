@@ -149,10 +149,14 @@ _MOSAIC_VARIANT_SELECTION_CACHE_MAX = 256
 _MOSAIC_DECODE_FAILURE_CACHE_MAX = 256
 _THROUGHPUT_V2_CANARY_SHAPE_TABLE: dict[_MOSAIC_VARIANT_KEY, str] = {
     (512, 128, 16, 256, 16, 8, "bfloat16"): "throughput_v2",
+    (512, 128, 24, 256, 16, 8, "bfloat16"): "throughput_v2",
     (512, 128, 32, 256, 16, 8, "bfloat16"): "throughput_v2",
+    (512, 128, 48, 256, 16, 8, "bfloat16"): "throughput_v2",
     (512, 128, 64, 256, 16, 8, "bfloat16"): "throughput_v2",
     (1024, 128, 16, 256, 16, 8, "bfloat16"): "throughput_v2",
+    (1024, 128, 32, 256, 16, 8, "bfloat16"): "throughput_v2",
     (2048, 128, 16, 256, 16, 8, "bfloat16"): "throughput_v2",
+    (2048, 128, 32, 256, 16, 8, "bfloat16"): "throughput_v2",
     (4096, 128, 16, 256, 16, 8, "bfloat16"): "throughput_v2",
 }
 

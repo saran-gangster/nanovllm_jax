@@ -40,17 +40,22 @@ def test_build_promotion_gate_cases_supports_mosaic_and_jax_variants() -> None:
     assert cases[2]["env__NANOVLLM_JAX_ENABLE_THROUGHPUT_V2_MOSAIC"] == "0"
 
 
-def test_build_canary_kernel_table_uses_primary_rows_by_default() -> None:
+def test_build_canary_kernel_table_uses_extended_rows_by_default() -> None:
     table = build_canary_kernel_table()
 
-    assert table == {
-        "batch=512,head_dim=128,blocks=16,block_size=256,num_heads=16,num_kv_heads=8,dtype=bfloat16": "throughput_v2",
-        "batch=512,head_dim=128,blocks=32,block_size=256,num_heads=16,num_kv_heads=8,dtype=bfloat16": "throughput_v2",
-        "batch=512,head_dim=128,blocks=64,block_size=256,num_heads=16,num_kv_heads=8,dtype=bfloat16": "throughput_v2",
-        "batch=1024,head_dim=128,blocks=16,block_size=256,num_heads=16,num_kv_heads=8,dtype=bfloat16": "throughput_v2",
-        "batch=2048,head_dim=128,blocks=16,block_size=256,num_heads=16,num_kv_heads=8,dtype=bfloat16": "throughput_v2",
-        "batch=4096,head_dim=128,blocks=16,block_size=256,num_heads=16,num_kv_heads=8,dtype=bfloat16": "throughput_v2",
-    }
+    assert len(table) == 10
+    assert table[
+        "batch=512,head_dim=128,blocks=16,block_size=256,num_heads=16,num_kv_heads=8,dtype=bfloat16"
+    ] == "throughput_v2"
+    assert table[
+        "batch=512,head_dim=128,blocks=24,block_size=256,num_heads=16,num_kv_heads=8,dtype=bfloat16"
+    ] == "throughput_v2"
+    assert table[
+        "batch=512,head_dim=128,blocks=48,block_size=256,num_heads=16,num_kv_heads=8,dtype=bfloat16"
+    ] == "throughput_v2"
+    assert table[
+        "batch=2048,head_dim=128,blocks=32,block_size=256,num_heads=16,num_kv_heads=8,dtype=bfloat16"
+    ] == "throughput_v2"
 
 
 def test_build_split_sweep_cases_emits_requested_candidates() -> None:

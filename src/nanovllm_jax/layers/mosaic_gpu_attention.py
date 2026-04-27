@@ -151,6 +151,9 @@ _THROUGHPUT_SPLITK_TABLE_PATH = (
     os.environ.get("NANOVLLM_JAX_MOSAIC_THROUGHPUT_SPLITK_TABLE_PATH", "").strip() or None
 )
 _THROUGHPUT_SPLITK_TABLE: dict[tuple[object, ...], int] | None = None
+_THROUGHPUT_V2_CANARY_SPLITK_TABLE: dict[tuple[object, ...], int] = {
+    (512, 128, 64, 256, 16, 8, "bfloat16"): 8,
+}
 _PARTITIONED_DECODE_REDUCTION_BACKEND = os.environ.get(
     "NANOVLLM_JAX_PARTITIONED_DECODE_REDUCTION_BACKEND", "streaming"
 ).strip().lower()
@@ -282,7 +285,12 @@ def _lookup_throughput_splitk_override(
     override = _THROUGHPUT_SPLITK_TABLE.get(strict_key)
     if override is not None:
         return override
-    return _THROUGHPUT_SPLITK_TABLE.get(key)
+    override = _THROUGHPUT_SPLITK_TABLE.get(key)
+    if override is not None:
+        return override
+    if _should_use_throughput_v2_mosaic_kernel():
+        return _THROUGHPUT_V2_CANARY_SPLITK_TABLE.get(strict_key)
+    return None
 
 
 def _pad_last_dim_to_multiple(

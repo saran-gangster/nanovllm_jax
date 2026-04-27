@@ -1,0 +1,12 @@
+{
+  "batch=1024,head_dim=128,blocks=16,block_size=256,num_heads=16,num_kv_heads=8,dtype=bfloat16": "throughput_v2",
+  "batch=1024,head_dim=128,blocks=32,block_size=256,num_heads=16,num_kv_heads=8,dtype=bfloat16": "throughput_v2",
+  "batch=2048,head_dim=128,blocks=16,block_size=256,num_heads=16,num_kv_heads=8,dtype=bfloat16": "throughput_v2",
+  "batch=2048,head_dim=128,blocks=32,block_size=256,num_heads=16,num_kv_heads=8,dtype=bfloat16": "throughput_v2",
+  "batch=4096,head_dim=128,blocks=16,block_size=256,num_heads=16,num_kv_heads=8,dtype=bfloat16": "throughput_v2",
+  "batch=512,head_dim=128,blocks=16,block_size=256,num_heads=16,num_kv_heads=8,dtype=bfloat16": "throughput_v2",
+  "batch=512,head_dim=128,blocks=24,block_size=256,num_heads=16,num_kv_heads=8,dtype=bfloat16": "throughput_v2",
+  "batch=512,head_dim=128,blocks=32,block_size=256,num_heads=16,num_kv_heads=8,dtype=bfloat16": "throughput_v2",
+  "batch=512,head_dim=128,blocks=48,block_size=256,num_heads=16,num_kv_heads=8,dtype=bfloat16": "throughput_v2",
+  "batch=512,head_dim=128,blocks=64,block_size=256,num_heads=16,num_kv_heads=8,dtype=bfloat16": "throughput_v2"
+}

@@ -584,3 +584,37 @@ def test_select_throughput_k_splits_strict_table_key(monkeypatch, tmp_path) -> N
 
     assert matching == 4
     assert mismatched_dtype == 1
+
+
+def test_select_throughput_k_splits_uses_canary_override_when_mosaic_enabled(monkeypatch) -> None:
+    monkeypatch.setattr(mga, "_THROUGHPUT_SPLITK_TABLE_PATH", None)
+    monkeypatch.setattr(mga, "_THROUGHPUT_SPLITK_TABLE", None)
+    monkeypatch.setattr(mga, "_should_use_throughput_v2_mosaic_kernel", lambda: True)
+
+    matching = mga._select_throughput_k_splits(
+        split_k=0,
+        batch_size=512,
+        head_dim=128,
+        num_heads=16,
+        block_q=64,
+        max_blocks_per_seq=64,
+        block_size=256,
+        block_kv=64,
+        num_kv_heads=8,
+        dtype="bfloat16",
+    )
+    mismatched_dtype = mga._select_throughput_k_splits(
+        split_k=0,
+        batch_size=512,
+        head_dim=128,
+        num_heads=16,
+        block_q=64,
+        max_blocks_per_seq=64,
+        block_size=256,
+        block_kv=64,
+        num_kv_heads=8,
+        dtype="float16",
+    )
+
+    assert matching == 8
+    assert mismatched_dtype == 1

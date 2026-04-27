@@ -129,7 +129,34 @@ def test_select_mosaic_decode_variant_canary_table_prefers_throughput_v2_when_en
         head_dim=128,
         max_blocks_per_seq=16,
         block_size=256,
+        num_heads=16,
+        num_kv_heads=8,
+        dtype="bfloat16",
     ) == "throughput_v2"
+
+    _dispatch_state().variant_selection_cache.clear()
+    assert pa._select_mosaic_decode_variant(
+        requested_variant="auto",
+        padded_batch=512,
+        head_dim=128,
+        max_blocks_per_seq=16,
+        block_size=256,
+        num_heads=32,
+        num_kv_heads=8,
+        dtype="bfloat16",
+    ) == "throughput"
+
+    _dispatch_state().variant_selection_cache.clear()
+    assert pa._select_mosaic_decode_variant(
+        requested_variant="auto",
+        padded_batch=512,
+        head_dim=128,
+        max_blocks_per_seq=16,
+        block_size=256,
+        num_heads=16,
+        num_kv_heads=8,
+        dtype="float16",
+    ) == "throughput"
 
 
 def test_select_mosaic_decode_variant_canary_table_does_not_expand_past_validated_shapes(monkeypatch) -> None:
@@ -145,6 +172,9 @@ def test_select_mosaic_decode_variant_canary_table_does_not_expand_past_validate
         head_dim=128,
         max_blocks_per_seq=48,
         block_size=256,
+        num_heads=16,
+        num_kv_heads=8,
+        dtype="bfloat16",
     ) == "throughput"
 
 
@@ -170,6 +200,41 @@ def test_select_mosaic_decode_variant_table_override_and_fallback() -> None:
         block_size=256,
     )
     assert selected_missing == "throughput"
+
+
+def test_select_mosaic_decode_variant_supports_strict_table_keys() -> None:
+    legacy_key = (512, 128, 16, 256)
+    strict_key = (512, 128, 16, 256, 16, 8, "bfloat16")
+    pa._MOSAIC_DECODE_FAMILY_TABLE = {
+        legacy_key: "baseline",
+        strict_key: "throughput_v2",
+    }
+    _dispatch_state().variant_selection_cache.clear()
+
+    selected = pa._select_mosaic_decode_variant(
+        requested_variant="auto",
+        padded_batch=512,
+        head_dim=128,
+        max_blocks_per_seq=16,
+        block_size=256,
+        num_heads=16,
+        num_kv_heads=8,
+        dtype="bfloat16",
+    )
+    assert selected == "throughput_v2"
+
+    _dispatch_state().variant_selection_cache.clear()
+    selected_mismatch = pa._select_mosaic_decode_variant(
+        requested_variant="auto",
+        padded_batch=512,
+        head_dim=128,
+        max_blocks_per_seq=16,
+        block_size=256,
+        num_heads=16,
+        num_kv_heads=8,
+        dtype="float16",
+    )
+    assert selected_mismatch == "baseline"
 
 
 def test_mosaic_decode_prefers_latency_family(monkeypatch) -> None:

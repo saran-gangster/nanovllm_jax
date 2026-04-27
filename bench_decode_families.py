@@ -300,6 +300,8 @@ def _build_family_runner(
             max_blocks_per_seq=args.max_blocks_per_seq,
             block_size=args.block_size,
             block_kv=config.block_kv,
+            num_kv_heads=args.num_kv_heads,
+            dtype=args.dtype,
         )
         prepared_metadata_cache: dict[tuple[Any, ...], object] = {}
         notes["prepared_metadata_cache_primed"] = False
@@ -331,6 +333,8 @@ def _build_family_runner(
             max_blocks_per_seq=args.max_blocks_per_seq,
             block_size=args.block_size,
             block_kv=config.block_kv,
+            num_kv_heads=args.num_kv_heads,
+            dtype=args.dtype,
         )
         plan = build_paged_decode_throughput_v2_plan(
             q=q,
@@ -402,6 +406,25 @@ def _output_checksum(output: Any) -> float:
     return checksum
 
 
+def _output_finite_summary(output: Any) -> dict[str, Any]:
+    leaves = jax.tree_util.tree_leaves(output)
+    if not leaves:
+        return {
+            "all_finite": True,
+            "nonfinite_count": 0,
+            "leaf_count": 0,
+        }
+    nonfinite_count = 0
+    for leaf in leaves:
+        finite = jnp.isfinite(jnp.asarray(leaf, dtype=jnp.float32))
+        nonfinite_count += int(finite.size - jnp.count_nonzero(finite))
+    return {
+        "all_finite": nonfinite_count == 0,
+        "nonfinite_count": nonfinite_count,
+        "leaf_count": len(leaves),
+    }
+
+
 def _max_abs_diff(a: Any, b: Any) -> float:
     a_leaves = jax.tree_util.tree_leaves(a)
     b_leaves = jax.tree_util.tree_leaves(b)
@@ -447,6 +470,7 @@ def main() -> None:
         _block_until_ready(last_output)
         iter_times_s.append(time.perf_counter() - start)
 
+    output_value = last_output if last_output is not None else first_output
     verify = None
     if args.verify_against_blockwise and args.family != "blockwise":
         ref = paged_decode_attention_blockwise(
@@ -461,7 +485,8 @@ def main() -> None:
         _block_until_ready(ref)
         verify = {
             "reference_family": "blockwise",
-            "max_abs_diff": _max_abs_diff(last_output if last_output is not None else first_output, ref),
+            "max_abs_diff": _max_abs_diff(output_value, ref),
+            "reference_all_finite": _output_finite_summary(ref)["all_finite"],
         }
 
     mean_s = statistics.mean(iter_times_s)
@@ -494,7 +519,8 @@ def main() -> None:
             "iter_times_ms": [value * 1000.0 for value in iter_times_s],
         },
         "output": {
-            "checksum_f32_sum": _output_checksum(last_output if last_output is not None else first_output),
+            "checksum_f32_sum": _output_checksum(output_value),
+            **_output_finite_summary(output_value),
         },
         "verify": verify,
         "family_notes": family_notes,

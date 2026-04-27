@@ -12,6 +12,9 @@ class PromotionGateRow:
     head_dim: int
     max_blocks_per_seq: int
     block_size: int = 256
+    num_heads: int = 16
+    num_kv_heads: int = 8
+    dtype: str = "bfloat16"
 
     @property
     def shape_key(self) -> str:
@@ -22,6 +25,15 @@ class PromotionGateRow:
 
     @property
     def table_key(self) -> str:
+        return (
+            f"batch={self.batch_size},head_dim={self.head_dim},"
+            f"blocks={self.max_blocks_per_seq},block_size={self.block_size},"
+            f"num_heads={self.num_heads},num_kv_heads={self.num_kv_heads},"
+            f"dtype={self.dtype}"
+        )
+
+    @property
+    def legacy_table_key(self) -> str:
         return (
             f"batch={self.batch_size},head_dim={self.head_dim},"
             f"blocks={self.max_blocks_per_seq},block_size={self.block_size}"

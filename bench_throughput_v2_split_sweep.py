@@ -96,10 +96,13 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     row = PromotionGateRow(
-        args.batch_size,
-        args.head_dim,
-        args.max_blocks_per_seq,
-        args.block_size,
+        batch_size=args.batch_size,
+        head_dim=args.head_dim,
+        max_blocks_per_seq=args.max_blocks_per_seq,
+        block_size=args.block_size,
+        num_heads=args.num_heads,
+        num_kv_heads=args.num_kv_heads,
+        dtype=args.dtype,
     )
     split_candidates = _parse_split_candidates(args.split_candidates)
     cases = build_split_sweep_cases(
@@ -216,17 +219,29 @@ def main() -> None:
     winner_split_k = None
     winner_mean_ms = None
     winner_diff = None
+    winner_all_finite = None
+    blockwise_mean_ms = float(baseline_summary["timings"]["mean_of_means_ms"])
     for case_name, summary in case_summaries.items():
         if not case_name.startswith("throughput_v2_mosaic_split"):
             continue
         if summary.get("failed"):
             continue
         mean_ms = float(summary["timings"]["mean_of_means_ms"])
+        max_abs_diff = (summary.get("verify", {}) or {}).get("max_abs_diff")
+        all_finite = bool((summary.get("output", {}) or {}).get("all_finite", False))
+        if (
+            mean_ms >= blockwise_mean_ms
+            or max_abs_diff is None
+            or float(max_abs_diff) > 1e-3
+            or not all_finite
+        ):
+            continue
         if winner_mean_ms is None or mean_ms < winner_mean_ms:
             winner_name = case_name
             winner_mean_ms = mean_ms
             winner_split_k = int(case_name.removeprefix("throughput_v2_mosaic_split"))
-            winner_diff = (summary.get("verify", {}) or {}).get("max_abs_diff")
+            winner_diff = max_abs_diff
+            winner_all_finite = all_finite
 
     override_table = None
     override_table_path = None
@@ -247,6 +262,14 @@ def main() -> None:
             "split_k": winner_split_k,
             "mean_of_means_ms": winner_mean_ms,
             "max_abs_diff": winner_diff,
+            "all_finite": winner_all_finite,
+            "qualified": winner_split_k is not None,
+        },
+        "gate": {
+            "blockwise_mean_of_means_ms": blockwise_mean_ms,
+            "requires_candidate_faster_than_blockwise": True,
+            "requires_max_abs_diff_lte": 1e-3,
+            "requires_all_outputs_finite": True,
         },
         "candidate_splitk_override_path": (
             str(override_table_path) if override_table_path is not None else None

@@ -44,12 +44,12 @@ def test_build_canary_kernel_table_uses_primary_rows_by_default() -> None:
     table = build_canary_kernel_table()
 
     assert table == {
-        "batch=512,head_dim=128,blocks=16,block_size=256": "throughput_v2",
-        "batch=512,head_dim=128,blocks=32,block_size=256": "throughput_v2",
-        "batch=512,head_dim=128,blocks=64,block_size=256": "throughput_v2",
-        "batch=1024,head_dim=128,blocks=16,block_size=256": "throughput_v2",
-        "batch=2048,head_dim=128,blocks=16,block_size=256": "throughput_v2",
-        "batch=4096,head_dim=128,blocks=16,block_size=256": "throughput_v2",
+        "batch=512,head_dim=128,blocks=16,block_size=256,num_heads=16,num_kv_heads=8,dtype=bfloat16": "throughput_v2",
+        "batch=512,head_dim=128,blocks=32,block_size=256,num_heads=16,num_kv_heads=8,dtype=bfloat16": "throughput_v2",
+        "batch=512,head_dim=128,blocks=64,block_size=256,num_heads=16,num_kv_heads=8,dtype=bfloat16": "throughput_v2",
+        "batch=1024,head_dim=128,blocks=16,block_size=256,num_heads=16,num_kv_heads=8,dtype=bfloat16": "throughput_v2",
+        "batch=2048,head_dim=128,blocks=16,block_size=256,num_heads=16,num_kv_heads=8,dtype=bfloat16": "throughput_v2",
+        "batch=4096,head_dim=128,blocks=16,block_size=256,num_heads=16,num_kv_heads=8,dtype=bfloat16": "throughput_v2",
     }
 
 
@@ -70,7 +70,7 @@ def test_build_splitk_override_table_targets_default_long_context_row() -> None:
     table = build_splitk_override_table(split_k=4)
 
     assert table == {
-        "batch=512,head_dim=128,blocks=64,block_size=256": 4,
+        "batch=512,head_dim=128,blocks=64,block_size=256,num_heads=16,num_kv_heads=8,dtype=bfloat16": 4,
     }
 
 

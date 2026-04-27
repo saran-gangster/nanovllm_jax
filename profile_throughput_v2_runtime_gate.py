@@ -101,15 +101,25 @@ def main() -> None:
         throughput_v2_summary=throughput_v2_summary,
     )
     runtime_gate["prompts"] = prompts
+    top_level_improves = (
+        runtime_gate["timings"]["top_level_total_s"]["delta"] is not None
+        and runtime_gate["timings"]["top_level_total_s"]["delta"] < 0.0
+    )
+    model_execute_improves = (
+        runtime_gate["timings"]["model_execute_total_s"]["delta"] is not None
+        and runtime_gate["timings"]["model_execute_total_s"]["delta"] < 0.0
+    )
     runtime_gate["gate"] = {
         "requires_token_identity": True,
-        "requires_top_level_improvement": (
-            runtime_gate["timings"]["top_level_total_s"]["delta"] is not None
-            and runtime_gate["timings"]["top_level_total_s"]["delta"] < 0.0
-        ),
-        "requires_model_execute_improvement": (
-            runtime_gate["timings"]["model_execute_total_s"]["delta"] is not None
-            and runtime_gate["timings"]["model_execute_total_s"]["delta"] < 0.0
+        "token_identity_passed": bool(runtime_gate["outputs_match"]),
+        "requires_top_level_improvement": True,
+        "top_level_improvement_passed": top_level_improves,
+        "requires_model_execute_improvement": True,
+        "model_execute_improvement_passed": model_execute_improves,
+        "passes_runtime_gate": (
+            bool(runtime_gate["outputs_match"])
+            and top_level_improves
+            and model_execute_improves
         ),
     }
 

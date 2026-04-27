@@ -543,3 +543,44 @@ def test_select_throughput_k_splits_table_override(monkeypatch) -> None:
         block_kv=64,
     )
     assert splits == 4
+
+
+def test_select_throughput_k_splits_strict_table_key(monkeypatch, tmp_path) -> None:
+    table_path = tmp_path / "splitk.json"
+    table_path.write_text(
+        (
+            '{"batch=512,head_dim=128,blocks=64,block_size=256,'
+            'num_heads=16,num_kv_heads=8,dtype=bfloat16": 4}'
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(mga, "_THROUGHPUT_SPLITK_TABLE_PATH", str(table_path))
+    monkeypatch.setattr(mga, "_THROUGHPUT_SPLITK_TABLE", None)
+
+    matching = mga._select_throughput_k_splits(
+        split_k=0,
+        batch_size=512,
+        head_dim=128,
+        num_heads=16,
+        block_q=64,
+        max_blocks_per_seq=64,
+        block_size=256,
+        block_kv=64,
+        num_kv_heads=8,
+        dtype="bfloat16",
+    )
+    mismatched_dtype = mga._select_throughput_k_splits(
+        split_k=0,
+        batch_size=512,
+        head_dim=128,
+        num_heads=16,
+        block_q=64,
+        max_blocks_per_seq=64,
+        block_size=256,
+        block_kv=64,
+        num_kv_heads=8,
+        dtype="float16",
+    )
+
+    assert matching == 4
+    assert mismatched_dtype == 1

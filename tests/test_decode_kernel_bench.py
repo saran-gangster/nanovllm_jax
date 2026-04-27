@@ -150,7 +150,11 @@ def test_summarize_and_compare_kernel_case_runs(tmp_path: Path) -> None:
                     "max_ms": 11.0,
                     "compile_and_first_run_s": 1.0,
                 },
-                "output": {"checksum_f32_sum": 1.25},
+                "output": {
+                    "checksum_f32_sum": 1.25,
+                    "all_finite": True,
+                    "nonfinite_count": 0,
+                },
                 "family_notes": {"note": "x"},
                 "verify": None,
             }
@@ -170,7 +174,11 @@ def test_summarize_and_compare_kernel_case_runs(tmp_path: Path) -> None:
                     "max_ms": 12.5,
                     "compile_and_first_run_s": 1.5,
                 },
-                "output": {"checksum_f32_sum": 1.25},
+                "output": {
+                    "checksum_f32_sum": 1.25,
+                    "all_finite": True,
+                    "nonfinite_count": 0,
+                },
                 "family_notes": {"note": "x"},
                 "verify": None,
             }
@@ -198,4 +206,6 @@ def test_summarize_and_compare_kernel_case_runs(tmp_path: Path) -> None:
 
     assert baseline_summary["timings"]["mean_of_means_ms"] == 10.0
     assert candidate_summary["timings"]["mean_of_means_ms"] == 12.0
+    assert baseline_summary["output"]["all_finite"] is True
+    assert baseline_summary["output"]["nonfinite_count"] == 0
     assert comparison["timings"]["mean_of_means_ms"]["delta"] == 2.0

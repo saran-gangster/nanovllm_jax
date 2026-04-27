@@ -80,6 +80,18 @@ def _common_args(args: argparse.Namespace, row: PromotionGateRow) -> dict[str, A
     }
 
 
+def _row_with_layout(row: PromotionGateRow, args: argparse.Namespace) -> PromotionGateRow:
+    return PromotionGateRow(
+        batch_size=row.batch_size,
+        head_dim=row.head_dim,
+        max_blocks_per_seq=row.max_blocks_per_seq,
+        block_size=row.block_size,
+        num_heads=args.num_heads,
+        num_kv_heads=args.num_kv_heads,
+        dtype=args.dtype,
+    )
+
+
 def _run_case(
     *,
     repo_root: Path,
@@ -224,16 +236,21 @@ def _run_row(
     throughput_v2_diff = None
     throughput_v2_pass = None
     throughput_v2_verify = None
+    throughput_v2_all_finite = None
     if throughput_v2_summary is not None and not throughput_v2_summary.get("failed"):
         throughput_v2_mean = float(throughput_v2_summary["timings"]["mean_of_means_ms"])
         throughput_v2_diff = (
             throughput_v2_summary.get("verify", {}) or {}
         ).get("max_abs_diff")
         throughput_v2_verify = throughput_v2_diff
+        throughput_v2_all_finite = bool(
+            (throughput_v2_summary.get("output", {}) or {}).get("all_finite", False)
+        )
         throughput_v2_pass = (
             throughput_v2_mean < blockwise_mean
             and throughput_v2_diff is not None
             and float(throughput_v2_diff) <= 1e-3
+            and throughput_v2_all_finite
         )
 
     row_summary = {
@@ -251,6 +268,7 @@ def _run_row(
             "blockwise_mean_of_means_ms": blockwise_mean,
             "throughput_v2_mosaic_mean_of_means_ms": throughput_v2_mean,
             "throughput_v2_mosaic_max_abs_diff": throughput_v2_verify,
+            "throughput_v2_mosaic_all_finite": throughput_v2_all_finite,
             "throughput_v2_mosaic_passes_row_gate": throughput_v2_pass,
         },
     }
@@ -264,7 +282,7 @@ def main() -> None:
     output_dir = Path(args.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    rows = build_promotion_gate_rows(args.matrix)
+    rows = [_row_with_layout(row, args) for row in build_promotion_gate_rows(args.matrix)]
     cases = build_promotion_gate_cases(include_jax_reference=args.include_jax_reference)
     manifest = build_kernel_benchmark_manifest(
         invocation={
@@ -308,6 +326,14 @@ def main() -> None:
         "matrix": args.matrix,
         "rows": {row_summary["shape_key"]: row_summary for row_summary in row_summaries},
         "candidate_rollout_rows": [row.shape_key for row in promoted_rows],
+        "gate": {
+            "row_count": len(rows),
+            "passed_row_count": len(promoted_rows),
+            "all_rows_passed": len(promoted_rows) == len(rows),
+            "requires_candidate_faster_than_blockwise": True,
+            "requires_max_abs_diff_lte": 1e-3,
+            "requires_all_outputs_finite": True,
+        },
         "candidate_rollout_table_path": (
             str(canary_table_path) if args.write_canary_table else None
         ),

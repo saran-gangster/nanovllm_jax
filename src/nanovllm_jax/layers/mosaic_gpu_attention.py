@@ -150,26 +150,38 @@ _BARRIER_BYTES_PER_SLOT = 16  # heuristic: small allowance per barrier slot
 _THROUGHPUT_SPLITK_TABLE_PATH = (
     os.environ.get("NANOVLLM_JAX_MOSAIC_THROUGHPUT_SPLITK_TABLE_PATH", "").strip() or None
 )
-_THROUGHPUT_SPLITK_TABLE: dict[tuple[int, int, int, int], int] | None = None
+_THROUGHPUT_SPLITK_TABLE: dict[tuple[object, ...], int] | None = None
 _PARTITIONED_DECODE_REDUCTION_BACKEND = os.environ.get(
     "NANOVLLM_JAX_PARTITIONED_DECODE_REDUCTION_BACKEND", "streaming"
 ).strip().lower()
 
 
-def _parse_shape_key(raw_key: str) -> tuple[int, int, int, int] | None:
-    fields: dict[str, int] = {}
+def _dtype_key(dtype: object) -> str:
+    return str(dtype).replace("'", "").strip().lower()
+
+
+def _parse_shape_key(raw_key: str) -> tuple[object, ...] | None:
+    fields: dict[str, str] = {}
     try:
         for token in raw_key.split(","):
             if "=" not in token:
                 return None
             key, value = token.split("=", 1)
-            fields[key.strip()] = int(value.strip())
-        return (
+            fields[key.strip()] = value.strip()
+        required = (
             int(fields["batch"]),
             int(fields["head_dim"]),
             int(fields["blocks"]),
             int(fields["block_size"]),
         )
+        if {"num_heads", "num_kv_heads", "dtype"} <= fields.keys():
+            return (
+                *required,
+                int(fields["num_heads"]),
+                int(fields["num_kv_heads"]),
+                _dtype_key(fields["dtype"]),
+            )
+        return required
     except Exception:
         return None
 
@@ -250,11 +262,26 @@ def _lookup_throughput_splitk_override(
     head_dim: int,
     max_blocks_per_seq: int,
     block_size: int,
+    num_heads: int = 0,
+    num_kv_heads: int = 0,
+    dtype: object = "unknown",
 ) -> int | None:
     _load_throughput_splitk_table_if_needed()
     if _THROUGHPUT_SPLITK_TABLE is None:
         return None
     key = (batch_size, head_dim, max_blocks_per_seq, block_size)
+    strict_key = (
+        batch_size,
+        head_dim,
+        max_blocks_per_seq,
+        block_size,
+        int(num_heads),
+        int(num_kv_heads),
+        _dtype_key(dtype),
+    )
+    override = _THROUGHPUT_SPLITK_TABLE.get(strict_key)
+    if override is not None:
+        return override
     return _THROUGHPUT_SPLITK_TABLE.get(key)
 
 
@@ -1560,6 +1587,8 @@ def _select_throughput_k_splits(
     max_blocks_per_seq: int,
     block_size: int,
     block_kv: int,
+    num_kv_heads: int = 0,
+    dtype: object = "unknown",
 ) -> int:
     """Pick split count for the throughput decode path with optional table override."""
 
@@ -1575,6 +1604,9 @@ def _select_throughput_k_splits(
         head_dim=head_dim,
         max_blocks_per_seq=max_blocks_per_seq,
         block_size=block_size,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        dtype=dtype,
     )
     if override is not None and split_k <= 0:
         target = min(int(override), max_blocks_per_seq, num_kv_tiles)
@@ -1903,6 +1935,8 @@ def paged_decode_attention_mosaic_throughput(
         max_blocks_per_seq=max_blocks_per_seq,
         block_size=block_size,
         block_kv=kernel_config.block_kv,
+        num_kv_heads=num_kv_heads,
+        dtype=q.dtype,
     )
     pages_per_partition = (max_blocks_per_seq + k_splits - 1) // k_splits
     if pages_per_partition <= 0:
@@ -2043,6 +2077,8 @@ def build_paged_decode_throughput_v2_plan(
         max_blocks_per_seq=max_blocks_per_seq,
         block_size=block_size,
         block_kv=kernel_config.block_kv,
+        num_kv_heads=num_kv_heads,
+        dtype=q.dtype,
     )
     pages_per_partition = (
         (max_blocks_per_seq + k_splits - 1) // k_splits if k_splits > 0 else 0

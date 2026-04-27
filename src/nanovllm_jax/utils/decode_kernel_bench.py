@@ -135,6 +135,11 @@ def summarize_kernel_case_runs(
     maxes = [float(record["timings"]["max_ms"]) for record in records]
     compiles = [float(record["timings"]["compile_and_first_run_s"]) for record in records]
     checksum = records[0].get("output", {}).get("checksum_f32_sum")
+    output_records = [record.get("output", {}) for record in records]
+    nonfinite_count = sum(
+        int(record.get("nonfinite_count", 0) or 0)
+        for record in output_records
+    )
     verify = records[0].get("verify")
     return {
         "format_version": 1,
@@ -154,6 +159,11 @@ def summarize_kernel_case_runs(
         },
         "output": {
             "checksum_f32_sum": checksum,
+            "all_finite": all(
+                bool(record.get("all_finite", True))
+                for record in output_records
+            ),
+            "nonfinite_count": nonfinite_count,
         },
         "verify": verify,
         "family_notes": records[0].get("family_notes", {}),

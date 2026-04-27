@@ -42,7 +42,8 @@ except ImportError:
     MOSAIC_AVAILABLE = False
     mosaic_attn = None
 
-_MOSAIC_VARIANT_KEY = tuple[int, int, int, int]
+_MOSAIC_SHAPE_KEY = tuple[int, int, int, int]
+_MOSAIC_VARIANT_KEY = tuple[int, int, int, int, int, int, str]
 _MOSAIC_FAILURE_KEY = tuple[str, int, int, int, int, int, int, int]
 
 
@@ -143,16 +144,16 @@ _MOSAIC_DECODE_KERNEL_FAMILY = os.environ.get(
 _MOSAIC_DECODE_FAMILY_TABLE_PATH = (
     os.environ.get("NANOVLLM_JAX_MOSAIC_DECODE_KERNEL_TABLE_PATH", "").strip() or None
 )
-_MOSAIC_DECODE_FAMILY_TABLE: dict[tuple[int, int, int, int], str] | None = None
+_MOSAIC_DECODE_FAMILY_TABLE: dict[tuple[object, ...], str] | None = None
 _MOSAIC_VARIANT_SELECTION_CACHE_MAX = 256
 _MOSAIC_DECODE_FAILURE_CACHE_MAX = 256
-_THROUGHPUT_V2_CANARY_SHAPE_TABLE: dict[tuple[int, int, int, int], str] = {
-    (512, 128, 16, 256): "throughput_v2",
-    (512, 128, 32, 256): "throughput_v2",
-    (512, 128, 64, 256): "throughput_v2",
-    (1024, 128, 16, 256): "throughput_v2",
-    (2048, 128, 16, 256): "throughput_v2",
-    (4096, 128, 16, 256): "throughput_v2",
+_THROUGHPUT_V2_CANARY_SHAPE_TABLE: dict[_MOSAIC_VARIANT_KEY, str] = {
+    (512, 128, 16, 256, 16, 8, "bfloat16"): "throughput_v2",
+    (512, 128, 32, 256, 16, 8, "bfloat16"): "throughput_v2",
+    (512, 128, 64, 256, 16, 8, "bfloat16"): "throughput_v2",
+    (1024, 128, 16, 256, 16, 8, "bfloat16"): "throughput_v2",
+    (2048, 128, 16, 256, 16, 8, "bfloat16"): "throughput_v2",
+    (4096, 128, 16, 256, 16, 8, "bfloat16"): "throughput_v2",
 }
 
 
@@ -165,20 +166,32 @@ def _normalize_mosaic_variant(raw: object) -> str:
     )
 
 
-def _parse_shape_key(raw_key: str) -> tuple[int, int, int, int] | None:
-    fields: dict[str, int] = {}
+def _dtype_key(dtype: object) -> str:
+    return str(dtype).replace("'", "").strip().lower()
+
+
+def _parse_shape_key(raw_key: str) -> tuple[object, ...] | None:
+    fields: dict[str, str] = {}
     try:
         for token in raw_key.split(","):
             if "=" not in token:
                 return None
             key, value = token.split("=", 1)
-            fields[key.strip()] = int(value.strip())
-        return (
+            fields[key.strip()] = value.strip()
+        required = (
             int(fields["batch"]),
             int(fields["head_dim"]),
             int(fields["blocks"]),
             int(fields["block_size"]),
         )
+        if {"num_heads", "num_kv_heads", "dtype"} <= fields.keys():
+            return (
+                *required,
+                int(fields["num_heads"]),
+                int(fields["num_kv_heads"]),
+                _dtype_key(fields["dtype"]),
+            )
+        return required
     except Exception:
         return None
 
@@ -208,10 +221,14 @@ def _load_mosaic_variant_table_if_needed() -> None:
 
 
 def _lookup_mosaic_variant_table(
-    shape_key: tuple[int, int, int, int],
+    shape_key: _MOSAIC_SHAPE_KEY,
+    strict_shape_key: _MOSAIC_VARIANT_KEY,
 ) -> str | None:
     _load_mosaic_variant_table_if_needed()
     if _MOSAIC_DECODE_FAMILY_TABLE is not None:
+        override = _MOSAIC_DECODE_FAMILY_TABLE.get(strict_shape_key)
+        if override is not None:
+            return override
         override = _MOSAIC_DECODE_FAMILY_TABLE.get(shape_key)
         if override is not None:
             return override
@@ -223,7 +240,7 @@ def _lookup_mosaic_variant_table(
             lambda: False,
         )()
     ):
-        return _THROUGHPUT_V2_CANARY_SHAPE_TABLE.get(shape_key)
+        return _THROUGHPUT_V2_CANARY_SHAPE_TABLE.get(strict_shape_key)
     return None
 
 
@@ -249,6 +266,9 @@ def _select_mosaic_decode_variant(
     head_dim: int,
     max_blocks_per_seq: int,
     block_size: int,
+    num_heads: int = 0,
+    num_kv_heads: int = 0,
+    dtype: object = "unknown",
 ) -> str:
     state = get_attention_backend_runtime_state()
     requested = _normalize_mosaic_variant(requested_variant)
@@ -256,18 +276,27 @@ def _select_mosaic_decode_variant(
         return requested
 
     shape_key = (padded_batch, head_dim, max_blocks_per_seq, block_size)
-    cached = state.variant_selection_cache.get(shape_key)
+    strict_shape_key = (
+        padded_batch,
+        head_dim,
+        max_blocks_per_seq,
+        block_size,
+        int(num_heads),
+        int(num_kv_heads),
+        _dtype_key(dtype),
+    )
+    cached = state.variant_selection_cache.get(strict_shape_key)
     if cached is not None:
         return cached
 
-    variant = _lookup_mosaic_variant_table(shape_key)
+    variant = _lookup_mosaic_variant_table(shape_key, strict_shape_key)
     if variant is None:
         variant = _heuristic_mosaic_variant(
             padded_batch=padded_batch,
             head_dim=head_dim,
             max_blocks_per_seq=max_blocks_per_seq,
         )
-    state.variant_selection_cache[shape_key] = variant
+    state.variant_selection_cache[strict_shape_key] = variant
     if len(state.variant_selection_cache) > _MOSAIC_VARIANT_SELECTION_CACHE_MAX:
         state.variant_selection_cache.clear()
     return variant
@@ -461,6 +490,9 @@ def _maybe_run_mosaic_decode(
         head_dim=q.shape[-1],
         max_blocks_per_seq=block_tables.shape[1],
         block_size=block_size_int,
+        num_heads=q.shape[1],
+        num_kv_heads=k_cache.shape[2],
+        dtype=q.dtype,
     )
 
     if selected_variant == "throughput_v2":

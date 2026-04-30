@@ -4,11 +4,14 @@ import pytest
 
 from nanovllm_jax.utils.throughput_v2_gate import (
     DEFAULT_RUNTIME_GATE_PROMPTS,
+    DEFAULT_SPEED_WINDOW_SPLIT_CANDIDATES,
     build_canary_kernel_table,
     build_promotion_gate_cases,
     build_promotion_gate_rows,
+    build_speed_window_split_rows,
     build_splitk_override_table,
     build_split_sweep_cases,
+    merge_splitk_override_tables,
     summarize_runtime_gate,
 )
 
@@ -71,12 +74,56 @@ def test_build_split_sweep_cases_emits_requested_candidates() -> None:
     assert cases[3]["throughput_split_k"] == 8
 
 
+def test_build_split_sweep_cases_can_compare_current_mosaic_default() -> None:
+    cases = build_split_sweep_cases(
+        split_candidates=(1, 2),
+        include_current_mosaic=True,
+    )
+
+    assert [case["name"] for case in cases] == [
+        "blockwise",
+        "throughput_v2_mosaic_default",
+        "throughput_v2_mosaic_split1",
+        "throughput_v2_mosaic_split2",
+    ]
+    assert cases[1]["env__NANOVLLM_JAX_ENABLE_THROUGHPUT_V2_MOSAIC"] == "1"
+    assert "throughput_split_k" not in cases[1]
+
+
+def test_build_speed_window_split_rows_matches_expert_target_rows() -> None:
+    rows = build_speed_window_split_rows()
+
+    assert DEFAULT_SPEED_WINDOW_SPLIT_CANDIDATES == (1, 2, 4, 8, 16)
+    assert [row.shape_key for row in rows] == [
+        "b512_hd128_mb24_bs256",
+        "b512_hd128_mb48_bs256",
+        "b512_hd128_mb64_bs256",
+        "b1024_hd128_mb32_bs256",
+        "b2048_hd128_mb32_bs256",
+    ]
+
+
 def test_build_splitk_override_table_targets_default_long_context_row() -> None:
     table = build_splitk_override_table(split_k=4)
 
     assert table == {
         "batch=512,head_dim=128,blocks=64,block_size=256,num_heads=16,num_kv_heads=8,dtype=bfloat16": 4,
     }
+
+
+def test_merge_splitk_override_tables_rejects_conflicts() -> None:
+    table_a = {
+        "batch=512,head_dim=128,blocks=64,block_size=256,num_heads=16,num_kv_heads=8,dtype=bfloat16": 4,
+    }
+    table_b = {
+        "batch=1024,head_dim=128,blocks=32,block_size=256,num_heads=16,num_kv_heads=8,dtype=bfloat16": 8,
+    }
+
+    merged = merge_splitk_override_tables([table_a, table_b])
+
+    assert merged == {**table_a, **table_b}
+    with pytest.raises(ValueError):
+        merge_splitk_override_tables([table_a, {next(iter(table_a)): 8}])
 
 
 def test_runtime_gate_defaults_are_three_deterministic_prompts() -> None:

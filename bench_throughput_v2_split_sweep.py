@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sweep throughput-v2 split policy for the weakest long-context row."""
+"""Sweep throughput-v2 split policy for one throughput-v2 row."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from nanovllm_jax.utils.decode_kernel_bench import (
     summarize_kernel_case_runs,
 )
 from nanovllm_jax.utils.throughput_v2_gate import (
+    DEFAULT_SPEED_WINDOW_SPLIT_CANDIDATES,
     DEFAULT_SPLIT_SWEEP_ROW,
     PromotionGateRow,
     build_split_sweep_cases,
@@ -52,7 +53,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--repetitions", type=int, default=3)
-    parser.add_argument("--split-candidates", default="2,4,8")
+    parser.add_argument(
+        "--split-candidates",
+        default=",".join(str(value) for value in DEFAULT_SPEED_WINDOW_SPLIT_CANDIDATES),
+    )
+    parser.add_argument(
+        "--include-current-mosaic",
+        action="store_true",
+        help="Compare forced split candidates against the current default throughput_v2_mosaic policy.",
+    )
     parser.add_argument("--include-jax-reference", action="store_true")
     parser.add_argument("--verify-against-blockwise", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
@@ -73,6 +82,21 @@ def _parse_split_candidates(raw: str) -> tuple[int, ...]:
     if not values:
         raise ValueError("--split-candidates must include at least one integer")
     return tuple(values)
+
+
+def _case_mean_ms(summary: dict[str, Any] | None) -> float | None:
+    if summary is None or summary.get("failed"):
+        return None
+    timings = summary.get("timings", {}) or {}
+    value = timings.get("mean_of_means_ms")
+    return float(value) if value is not None else None
+
+
+def _forced_split_from_case_name(case_name: str) -> int | None:
+    prefix = "throughput_v2_mosaic_split"
+    if not case_name.startswith(prefix):
+        return None
+    return int(case_name.removeprefix(prefix))
 
 
 def _common_args(args: argparse.Namespace, row: PromotionGateRow) -> dict[str, Any]:
@@ -107,6 +131,7 @@ def main() -> None:
     split_candidates = _parse_split_candidates(args.split_candidates)
     cases = build_split_sweep_cases(
         split_candidates=split_candidates,
+        include_current_mosaic=args.include_current_mosaic,
         include_jax_reference=args.include_jax_reference,
     )
 
@@ -215,14 +240,22 @@ def main() -> None:
         _write_json(comparison_path, comparison)
         comparisons[case_name] = str(comparison_path)
 
-    winner_name = None
-    winner_split_k = None
-    winner_mean_ms = None
+    winner_name: str | None = None
+    winner_split_k: int | None = None
+    winner_mean_ms: float | None = None
     winner_diff = None
     winner_all_finite = None
     blockwise_mean_ms = float(baseline_summary["timings"]["mean_of_means_ms"])
+    current_mosaic_summary = case_summaries.get("throughput_v2_mosaic_default")
+    current_mosaic_mean_ms = _case_mean_ms(current_mosaic_summary)
+    comparison_mean_ms = [
+        value
+        for value in (blockwise_mean_ms, current_mosaic_mean_ms)
+        if value is not None
+    ]
     for case_name, summary in case_summaries.items():
-        if not case_name.startswith("throughput_v2_mosaic_split"):
+        forced_split = _forced_split_from_case_name(case_name)
+        if forced_split is None:
             continue
         if summary.get("failed"):
             continue
@@ -230,7 +263,7 @@ def main() -> None:
         max_abs_diff = (summary.get("verify", {}) or {}).get("max_abs_diff")
         all_finite = bool((summary.get("output", {}) or {}).get("all_finite", False))
         if (
-            mean_ms >= blockwise_mean_ms
+            any(mean_ms >= comparison_mean for comparison_mean in comparison_mean_ms)
             or max_abs_diff is None
             or float(max_abs_diff) > 1e-3
             or not all_finite
@@ -239,7 +272,7 @@ def main() -> None:
         if winner_mean_ms is None or mean_ms < winner_mean_ms:
             winner_name = case_name
             winner_mean_ms = mean_ms
-            winner_split_k = int(case_name.removeprefix("throughput_v2_mosaic_split"))
+            winner_split_k = forced_split
             winner_diff = max_abs_diff
             winner_all_finite = all_finite
 
@@ -267,7 +300,11 @@ def main() -> None:
         },
         "gate": {
             "blockwise_mean_of_means_ms": blockwise_mean_ms,
+            "current_mosaic_default_mean_of_means_ms": current_mosaic_mean_ms,
             "requires_candidate_faster_than_blockwise": True,
+            "requires_candidate_faster_than_current_mosaic_default": (
+                current_mosaic_mean_ms is not None
+            ),
             "requires_max_abs_diff_lte": 1e-3,
             "requires_all_outputs_finite": True,
         },

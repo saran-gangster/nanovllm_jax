@@ -51,6 +51,16 @@ PRIMARY_PROMOTION_ROWS: tuple[PromotionGateRow, ...] = (
 
 DEFAULT_SPLIT_SWEEP_ROW = PromotionGateRow(512, 128, 64)
 
+SPEED_WINDOW_SPLIT_SWEEP_ROWS: tuple[PromotionGateRow, ...] = (
+    PromotionGateRow(512, 128, 24),
+    PromotionGateRow(512, 128, 48),
+    PromotionGateRow(512, 128, 64),
+    PromotionGateRow(1024, 128, 32),
+    PromotionGateRow(2048, 128, 32),
+)
+
+DEFAULT_SPEED_WINDOW_SPLIT_CANDIDATES: tuple[int, ...] = (1, 2, 4, 8, 16)
+
 EXTENDED_PROMOTION_ROWS: tuple[PromotionGateRow, ...] = (
     *PRIMARY_PROMOTION_ROWS,
     PromotionGateRow(512, 128, 24),
@@ -73,6 +83,11 @@ def build_promotion_gate_rows(matrix: str = "extended") -> list[PromotionGateRow
     if matrix_key == "extended":
         return list(EXTENDED_PROMOTION_ROWS)
     raise ValueError(f"Unsupported promotion matrix: {matrix!r}")
+
+
+def build_speed_window_split_rows() -> list[PromotionGateRow]:
+    """Rows where split policy is most likely to move throughput-v2."""
+    return list(SPEED_WINDOW_SPLIT_SWEEP_ROWS)
 
 
 def build_canary_kernel_table(
@@ -111,7 +126,8 @@ def build_promotion_gate_cases(*, include_jax_reference: bool = False) -> list[d
 
 def build_split_sweep_cases(
     *,
-    split_candidates: tuple[int, ...] = (2, 4, 8),
+    split_candidates: tuple[int, ...] = DEFAULT_SPEED_WINDOW_SPLIT_CANDIDATES,
+    include_current_mosaic: bool = False,
     include_jax_reference: bool = False,
 ) -> list[dict[str, Any]]:
     cases: list[dict[str, Any]] = [
@@ -120,6 +136,15 @@ def build_split_sweep_cases(
             "family": "blockwise",
         },
     ]
+    if include_current_mosaic:
+        cases.append(
+            {
+                "name": "throughput_v2_mosaic_default",
+                "family": "throughput_v2",
+                "env__NANOVLLM_JAX_ENABLE_THROUGHPUT_V2_MOSAIC": "1",
+                "env__NANOVLLM_JAX_MOSAIC_DECODE_KERNEL": "throughput_v2",
+            }
+        )
     if include_jax_reference:
         cases.append(
             {
@@ -150,6 +175,22 @@ def build_splitk_override_table(
     if int(split_k) < 1:
         raise ValueError("split_k override must be >= 1")
     return {row.table_key: int(split_k)}
+
+
+def merge_splitk_override_tables(
+    tables: list[dict[str, int]] | tuple[dict[str, int], ...],
+) -> dict[str, int]:
+    """Merge strict split-k override tables, rejecting contradictory entries."""
+    merged: dict[str, int] = {}
+    for table in tables:
+        for key, value in table.items():
+            split_k = int(value)
+            if split_k < 1:
+                raise ValueError("split-k override values must be >= 1")
+            if key in merged and merged[key] != split_k:
+                raise ValueError(f"Conflicting split-k override for {key!r}")
+            merged[key] = split_k
+    return merged
 
 
 def summarize_runtime_gate(

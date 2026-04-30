@@ -140,8 +140,10 @@ class ModelRunner:
         self._decode_runtime_cache: DecodeRuntimeCache | None = None
         self._prefill_runtime_cache: PrefillRuntimeCache | None = None
         self._last_decode_profile: dict | None = None
+        self._last_generation_debug: dict | None = None
         self._last_decode_prepare_stats: dict | None = None
         self._last_decode_schedule_action: str | None = None
+        self.capture_generation_debug = False
         self._prefill_pos_template = np.arange(
             max(1, config.max_model_len), dtype=np.int32,
         )
@@ -868,6 +870,7 @@ class ModelRunner:
         """
         real_batch_size = len(seqs)
         self._last_decode_profile = None
+        self._last_generation_debug = None
         self._last_decode_prepare_stats = None
 
         # Prepare inputs
@@ -896,6 +899,10 @@ class ModelRunner:
         # Run model
         model_started_at = time.perf_counter() if profile_enabled else 0.0
         logits = self._run_model(input_ids, positions, context, is_prefill)
+        capture_generation_debug = bool(getattr(self, "capture_generation_debug", False))
+        debug_logits = None
+        if capture_generation_debug and self.tp_rank == 0 and logits is not None:
+            debug_logits = logits[:real_batch_size]
         if profile_enabled:
             block_until_ready_tree(logits)
             assert self._last_decode_profile is not None
@@ -967,6 +974,22 @@ class ModelRunner:
             # Slice away padded rows.
             if token_ids.shape[0] != real_batch_size:
                 token_ids = token_ids[:real_batch_size]
+            if capture_generation_debug:
+                self._last_generation_debug = {
+                    "phase": "prefill" if is_prefill else "decode",
+                    "is_prefill": bool(is_prefill),
+                    "real_batch_size": int(real_batch_size),
+                    "padded_batch_size": int(logits.shape[0]),
+                    "seq_ids": [int(seq.seq_id) for seq in seqs],
+                    "prefix_token_ids": [
+                        [int(token) for token in seq.token_ids] for seq in seqs
+                    ],
+                    "logits": debug_logits,
+                    "sampled_token_ids": np.asarray(jax.device_get(token_ids)).astype(
+                        np.int64,
+                        copy=False,
+                    ),
+                }
             # Move to host as a compact NumPy array (avoids slow Python `.tolist()`).
             return jax.device_get(token_ids)
         
@@ -983,6 +1006,7 @@ class ModelRunner:
         self._decode_schedule_token = 0
         self._last_decode_schedule_action = None
         self._last_decode_prepare_stats = None
+        self._last_generation_debug = None
         if hasattr(self, "kv_cache"):
             del self.kv_cache
         if hasattr(self, "model"):
@@ -992,3 +1016,92 @@ class ModelRunner:
         profile = self._last_decode_profile
         self._last_decode_profile = None
         return profile
+
+    def consume_last_generation_debug(
+        self,
+        *,
+        top_k: int = 10,
+        save_logits_path: str | os.PathLike[str] | None = None,
+    ) -> dict | None:
+        """Return top-k/logit diagnostics for the last generation step.
+
+        This is intentionally opt-in via ``capture_generation_debug`` because it
+        can retain a full logits buffer until consumed by diagnostic tooling.
+        """
+
+        payload = self._last_generation_debug
+        self._last_generation_debug = None
+        if payload is None:
+            return None
+
+        logits = payload.pop("logits", None)
+        sampled_token_ids = payload.pop("sampled_token_ids", None)
+        if logits is None or sampled_token_ids is None:
+            payload["logits_available"] = False
+            return payload
+
+        logits_f32 = logits.astype(jnp.float32)
+        vocab_size = int(logits_f32.shape[-1])
+        resolved_top_k = max(1, min(int(top_k), vocab_size))
+        top_values, top_indices = jax.lax.top_k(logits_f32, resolved_top_k)
+        top_values_np = np.asarray(jax.device_get(top_values))
+        top_indices_np = np.asarray(jax.device_get(top_indices))
+
+        sampled_np = np.asarray(sampled_token_ids, dtype=np.int64)
+        sampled_safe = jnp.asarray(np.clip(sampled_np, 0, vocab_size - 1), dtype=jnp.int32)
+        sampled_logits = jnp.take_along_axis(
+            logits_f32,
+            sampled_safe[:, None],
+            axis=1,
+        )[:, 0]
+        sampled_logits_np = np.asarray(jax.device_get(sampled_logits))
+        sampled_rank = jnp.sum(
+            logits_f32 > sampled_logits[:, None],
+            axis=1,
+        ) + 1
+        sampled_rank_np = np.asarray(jax.device_get(sampled_rank))
+
+        if save_logits_path is not None:
+            logits_path = os.fspath(save_logits_path)
+            os.makedirs(os.path.dirname(logits_path), exist_ok=True)
+            np.save(logits_path, np.asarray(jax.device_get(logits_f32)))
+            payload["logits_path"] = logits_path
+
+        margins: list[float | None] = []
+        for row_values in top_values_np:
+            if resolved_top_k >= 2:
+                margins.append(float(row_values[0] - row_values[1]))
+            else:
+                margins.append(None)
+
+        payload.update(
+            {
+                "logits_available": True,
+                "logits_shape": [int(dim) for dim in logits_f32.shape],
+                "logits_dtype": str(logits.dtype),
+                "top_k": int(resolved_top_k),
+                "sampled_token_ids": [int(token) for token in sampled_np.tolist()],
+                "argmax_token_ids": [
+                    int(token) for token in top_indices_np[:, 0].tolist()
+                ],
+                "argmax_logits": [
+                    float(value) for value in top_values_np[:, 0].tolist()
+                ],
+                "argmax_margins": margins,
+                "sampled_token_logits": [
+                    float(value) for value in sampled_logits_np.tolist()
+                ],
+                "sampled_token_ranks": [
+                    int(value) for value in sampled_rank_np.tolist()
+                ],
+                "top_token_ids": [
+                    [int(token) for token in row.tolist()]
+                    for row in top_indices_np
+                ],
+                "top_logits": [
+                    [float(value) for value in row.tolist()]
+                    for row in top_values_np
+                ],
+            }
+        )
+        return payload

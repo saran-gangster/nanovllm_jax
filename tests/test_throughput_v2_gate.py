@@ -155,5 +155,47 @@ def test_summarize_runtime_gate_compares_outputs_and_timings() -> None:
     )
 
     assert summary["outputs_match"] is True
+    assert summary["output_mismatches"] == []
     assert summary["timings"]["top_level_total_s"]["delta"] == pytest.approx(-0.4)
     assert summary["timings"]["model_execute_total_s"]["delta"] == pytest.approx(-0.3)
+
+
+def test_summarize_runtime_gate_reports_first_token_mismatch() -> None:
+    blockwise = {
+        "outputs": {
+            "records": [
+                {"index": 0, "token_ids": [1, 2, 3], "text": "a"},
+                {"index": 1, "token_ids": [4, 5, 6], "text": "b"},
+            ],
+        },
+        "timings": {},
+    }
+    throughput_v2 = {
+        "outputs": {
+            "records": [
+                {"index": 0, "token_ids": [1, 2, 3], "text": "a"},
+                {"index": 1, "token_ids": [4, 9, 6], "text": "c"},
+            ],
+        },
+        "timings": {},
+    }
+
+    summary = summarize_runtime_gate(
+        blockwise_summary=blockwise,
+        throughput_v2_summary=throughput_v2,
+    )
+
+    assert summary["outputs_match"] is False
+    assert summary["output_mismatches"] == [
+        {
+            "index": 1,
+            "reason": "token_ids_diff",
+            "blockwise_token_count": 3,
+            "throughput_v2_token_count": 3,
+            "first_diff": {
+                "token_index": 1,
+                "blockwise_token_id": 5,
+                "throughput_v2_token_id": 9,
+            },
+        }
+    ]

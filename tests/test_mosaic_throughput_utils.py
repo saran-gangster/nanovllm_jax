@@ -616,5 +616,52 @@ def test_select_throughput_k_splits_uses_canary_override_when_mosaic_enabled(mon
         dtype="float16",
     )
 
-    assert matching == 8
+    assert matching == 16
     assert mismatched_dtype == 1
+
+
+def test_select_throughput_k_splits_uses_speed_window_canary_overrides(monkeypatch) -> None:
+    monkeypatch.setattr(mga, "_THROUGHPUT_SPLITK_TABLE_PATH", None)
+    monkeypatch.setattr(mga, "_THROUGHPUT_SPLITK_TABLE", None)
+    monkeypatch.setattr(mga, "_should_use_throughput_v2_mosaic_kernel", lambda: True)
+
+    split_512x24 = mga._select_throughput_k_splits(
+        split_k=0,
+        batch_size=512,
+        head_dim=128,
+        num_heads=16,
+        block_q=64,
+        max_blocks_per_seq=24,
+        block_size=256,
+        block_kv=64,
+        num_kv_heads=8,
+        dtype="bfloat16",
+    )
+    split_512x48 = mga._select_throughput_k_splits(
+        split_k=0,
+        batch_size=512,
+        head_dim=128,
+        num_heads=16,
+        block_q=64,
+        max_blocks_per_seq=48,
+        block_size=256,
+        block_kv=64,
+        num_kv_heads=8,
+        dtype="bfloat16",
+    )
+    split_1024x32 = mga._select_throughput_k_splits(
+        split_k=0,
+        batch_size=1024,
+        head_dim=128,
+        num_heads=16,
+        block_q=64,
+        max_blocks_per_seq=32,
+        block_size=256,
+        block_kv=64,
+        num_kv_heads=8,
+        dtype="bfloat16",
+    )
+
+    assert split_512x24 == 8
+    assert split_512x48 == 16
+    assert split_1024x32 == 8

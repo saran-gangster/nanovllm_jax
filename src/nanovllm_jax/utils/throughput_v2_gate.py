@@ -193,6 +193,82 @@ def merge_splitk_override_tables(
     return merged
 
 
+def _summarize_output_mismatches(
+    blockwise_records: object,
+    throughput_records: object,
+) -> list[dict[str, Any]]:
+    if not isinstance(blockwise_records, list) or not isinstance(throughput_records, list):
+        return [
+            {
+                "reason": "records_not_lists",
+                "blockwise_record_type": type(blockwise_records).__name__,
+                "throughput_v2_record_type": type(throughput_records).__name__,
+            }
+        ]
+
+    mismatches: list[dict[str, Any]] = []
+    record_count = max(len(blockwise_records), len(throughput_records))
+    for index in range(record_count):
+        if index >= len(blockwise_records):
+            mismatches.append({"index": index, "reason": "missing_blockwise_record"})
+            continue
+        if index >= len(throughput_records):
+            mismatches.append({"index": index, "reason": "missing_throughput_v2_record"})
+            continue
+
+        blockwise_record = blockwise_records[index]
+        throughput_record = throughput_records[index]
+        if blockwise_record == throughput_record:
+            continue
+        if not isinstance(blockwise_record, dict) or not isinstance(throughput_record, dict):
+            mismatches.append({"index": index, "reason": "record_type_or_value_diff"})
+            continue
+
+        blockwise_tokens = blockwise_record.get("token_ids")
+        throughput_tokens = throughput_record.get("token_ids")
+        if isinstance(blockwise_tokens, list) and isinstance(throughput_tokens, list):
+            first_diff = None
+            for token_index, (blockwise_token, throughput_token) in enumerate(
+                zip(blockwise_tokens, throughput_tokens, strict=False)
+            ):
+                if blockwise_token != throughput_token:
+                    first_diff = {
+                        "token_index": token_index,
+                        "blockwise_token_id": blockwise_token,
+                        "throughput_v2_token_id": throughput_token,
+                    }
+                    break
+            if first_diff is None and len(blockwise_tokens) != len(throughput_tokens):
+                token_index = min(len(blockwise_tokens), len(throughput_tokens))
+                first_diff = {
+                    "token_index": token_index,
+                    "blockwise_token_id": (
+                        blockwise_tokens[token_index]
+                        if token_index < len(blockwise_tokens)
+                        else None
+                    ),
+                    "throughput_v2_token_id": (
+                        throughput_tokens[token_index]
+                        if token_index < len(throughput_tokens)
+                        else None
+                    ),
+                }
+            if first_diff is not None:
+                mismatches.append(
+                    {
+                        "index": index,
+                        "reason": "token_ids_diff",
+                        "blockwise_token_count": len(blockwise_tokens),
+                        "throughput_v2_token_count": len(throughput_tokens),
+                        "first_diff": first_diff,
+                    }
+                )
+                continue
+
+        mismatches.append({"index": index, "reason": "text_or_record_metadata_diff"})
+    return mismatches
+
+
 def summarize_runtime_gate(
     *,
     blockwise_summary: dict[str, Any],
@@ -205,11 +281,20 @@ def summarize_runtime_gate(
     outputs_match = (
         blockwise_outputs.get("records") == throughput_outputs.get("records")
     )
+    output_mismatches = (
+        []
+        if outputs_match
+        else _summarize_output_mismatches(
+            blockwise_outputs.get("records"),
+            throughput_outputs.get("records"),
+        )
+    )
     return {
         "format_version": 1,
         "blockwise_summary_path": blockwise_summary.get("summary_path"),
         "throughput_v2_summary_path": throughput_v2_summary.get("summary_path"),
         "outputs_match": outputs_match,
+        "output_mismatches": output_mismatches,
         "blockwise_output_records": blockwise_outputs.get("records"),
         "throughput_v2_output_records": throughput_outputs.get("records"),
         "timings": {

@@ -152,7 +152,11 @@ _THROUGHPUT_SPLITK_TABLE_PATH = (
 )
 _THROUGHPUT_SPLITK_TABLE: dict[tuple[object, ...], int] | None = None
 _THROUGHPUT_V2_CANARY_SPLITK_TABLE: dict[tuple[object, ...], int] = {
-    (512, 128, 64, 256, 16, 8, "bfloat16"): 8,
+    (512, 128, 24, 256, 16, 8, "bfloat16"): 8,
+    (512, 128, 48, 256, 16, 8, "bfloat16"): 16,
+    (512, 128, 64, 256, 16, 8, "bfloat16"): 16,
+    (1024, 128, 32, 256, 16, 8, "bfloat16"): 8,
+    (2048, 128, 32, 256, 16, 8, "bfloat16"): 8,
 }
 _PARTITIONED_DECODE_REDUCTION_BACKEND = os.environ.get(
     "NANOVLLM_JAX_PARTITIONED_DECODE_REDUCTION_BACKEND", "streaming"

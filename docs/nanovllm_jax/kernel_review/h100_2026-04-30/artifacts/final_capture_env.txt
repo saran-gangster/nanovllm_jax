@@ -1,0 +1,6 @@
+captured_at_utc=2026-04-30T12:04:23Z
+hostname=da33090e416c
+NVIDIA H100 80GB HBM3, 580.126.09, 81559 MiB
+1055bbb0e8f4ac56c06ebb559b3cda93ff1f9c55
+## expert/h100-mosaic-kernel-review-2026-04-12...origin/expert/h100-mosaic-kernel-review-2026-04-12
+jax 0.10.0 gpu [CudaDevice(id=0)]

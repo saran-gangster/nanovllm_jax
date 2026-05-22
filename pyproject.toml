@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanovllm-jax"
+version = "0.1.0"
+description = "Local JAX/Flax NNX inference runtime with paged KV cache"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = "MIT"
+dependencies = [
+  "flax>=0.11.0",
+  "numpy>=1.26.0",
+  "safetensors>=0.4.0",
+  "sentencepiece>=0.2.0",
+  "tqdm>=4.66.0",
+  "transformers>=4.45.0",
+  "xxhash>=3.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
